@@ -50,6 +50,11 @@ def _resolve_device(requested: str) -> torch.device:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
+        gpu_name = torch.cuda.get_device_name(device)
+        print(
+            f"[INFO] Using CUDA device: {gpu_name} "
+            f"(torch={torch.__version__}, cuda={torch.version.cuda})"
+        )
     return device
 
 

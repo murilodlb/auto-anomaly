@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -177,11 +178,63 @@ class RawAutoencoderModel:
             latent_dim=config.latent_dim,
             num_stages=config.num_stages,
             use_sigmoid=use_sigmoid,
-        ).to(device)
+        ).to(device=device)
+        if device.type == "cuda":
+            self.net.to(memory_format=torch.channels_last)
+
+        self._use_amp = bool(
+            config.use_amp and device.type == "cuda" and torch.cuda.is_bf16_supported()
+        )
 
         if config.loss_type not in _LOSS_FUNCTIONS:
             raise ValueError(f"Unsupported loss_type: {config.loss_type!r}")
         self._loss_fn = _LOSS_FUNCTIONS[config.loss_type]
+
+    def _maybe_preload_train_gpu(
+        self,
+        train_images: np.ndarray,
+        extractor: Any,
+    ) -> torch.Tensor | None:
+        """Cache uint8 training images in VRAM when CUDA is active and memory permits."""
+        if self.device.type != "cuda" or not hasattr(extractor, "normalize_uint8_tensor"):
+            return None
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(self.device)
+        except RuntimeError:
+            return None
+        if train_images.nbytes >= int(free_bytes * 0.25):
+            return None
+        return (
+            torch.from_numpy(np.ascontiguousarray(train_images))
+            .to(device=self.device)
+            .permute(0, 3, 1, 2)
+            .contiguous(memory_format=torch.channels_last)
+        )
+
+    def _iter_train_batches(
+        self,
+        train_images: np.ndarray,
+        extractor: Any,
+        train_gpu_u8: torch.Tensor | None,
+        epoch: int,
+    ) -> Iterator[torch.Tensor]:
+        """Yield shuffled (B, C, H, W) float32 training batches from GPU cache or CPU."""
+        if train_gpu_u8 is not None:
+            num_samples = train_gpu_u8.shape[0]
+            gen = torch.Generator(device=self.device).manual_seed(self.seed + epoch)
+            perm = torch.randperm(num_samples, device=self.device, generator=gen)
+            for start in range(0, num_samples, self.batch_size):
+                idx = perm[start : start + self.batch_size]
+                yield extractor.normalize_uint8_tensor(train_gpu_u8[idx])
+            return
+
+        for batch_np in iter_batches(
+            train_images,
+            batch_size=self.batch_size,
+            shuffle=True,
+            seed=self.seed + epoch,
+        ):
+            yield extractor.extract_batch(batch_np)
 
     def fit(self, train_images: np.ndarray, extractor: Any) -> list[float]:
         """Train the autoencoder on normal images and return per-epoch average losses."""
@@ -197,38 +250,33 @@ class RawAutoencoderModel:
         )
         num_samples = len(train_images)
         epoch_losses: list[float] = []
-        use_amp = (
-            self.config.use_amp and self.device.type == "cuda" and torch.cuda.is_bf16_supported()
-        )
+        train_gpu_u8 = self._maybe_preload_train_gpu(train_images, extractor)
 
         self.net.train()
-        for epoch in range(1, self.config.epochs + 1):
-            t0 = time.perf_counter()
-            running_loss = torch.zeros((), dtype=torch.float64, device=self.device)
+        try:
+            for epoch in range(1, self.config.epochs + 1):
+                t0 = time.perf_counter()
+                running_loss = torch.zeros((), dtype=torch.float64, device=self.device)
 
-            for batch_np in iter_batches(
-                train_images,
-                batch_size=self.batch_size,
-                shuffle=True,
-                seed=self.seed + epoch,
-            ):
-                x = extractor.extract_batch(batch_np)
-                optimizer.zero_grad(set_to_none=True)
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                    x_hat = self.net(x)
-                    loss = self._loss_fn(x_hat, x)
-                loss.backward()
-                optimizer.step()
-                running_loss += loss.detach().to(torch.float64) * len(batch_np)
+                for x in self._iter_train_batches(train_images, extractor, train_gpu_u8, epoch):
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self._use_amp):
+                        x_hat = self.net(x)
+                        loss = self._loss_fn(x_hat, x)
+                    loss.backward()
+                    optimizer.step()
+                    running_loss += loss.detach().to(torch.float64) * x.shape[0]
 
-            avg_loss = float(running_loss.item()) / max(1, num_samples)
-            epoch_losses.append(avg_loss)
-            elapsed = time.perf_counter() - t0
-            print(
-                f"Epoch [{epoch:03d}/{self.config.epochs:03d}] "
-                f"loss={avg_loss:.6f} ({elapsed:.2f}s)",
-                flush=True,
-            )
+                avg_loss = float(running_loss.item()) / max(1, num_samples)
+                epoch_losses.append(avg_loss)
+                elapsed = time.perf_counter() - t0
+                print(
+                    f"Epoch [{epoch:03d}/{self.config.epochs:03d}] "
+                    f"loss={avg_loss:.6f} ({elapsed:.2f}s)",
+                    flush=True,
+                )
+        finally:
+            del train_gpu_u8
 
         return epoch_losses
 
@@ -242,7 +290,9 @@ class RawAutoencoderModel:
         self.net.eval()
         with torch.inference_mode():
             x = extractor.extract_batch(batch_images)
-            x_hat = self.net(x)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self._use_amp):
+                x_hat = self.net(x)
+            x_hat = x_hat.float()
 
             if self.config.loss_type == "l1_ssim":
                 l1_map = (x - x_hat).abs().mean(dim=1, keepdim=True)
@@ -310,5 +360,7 @@ class RawAutoencoderModel:
                     f"Checkpoint mismatch for {key}: expected {val}, found {meta[key]}"
                 )
         self.net.load_state_dict(payload["state_dict"])
-        self.net.to(self.device)
+        self.net.to(device=self.device)
+        if self.device.type == "cuda":
+            self.net.to(memory_format=torch.channels_last)
         self.net.eval()

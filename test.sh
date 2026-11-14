@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=auto-anomaly-fullres
-#SBATCH --nodelist=gpu-4-h200
+#SBATCH --job-name=auto-anomaly
+#SBATCH --partition=gpu-4-h200
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --time=04:00:00
-#SBATCH --output=logs/%j_%x.out
-#SBATCH --error=logs/%j_%x.err
+#SBATCH --output=logs/%j.out
+#SBATCH --error=logs/%j.err
 
 # sbatch --export=ALL,CATEGORY=carpet,LOSS=l1_ssim,NUM_STAGES=4,BASE_CHANNELS=64,LATENT_DIM=256,BATCH_SIZE=16,EPOCHS=200,GAUSSIAN_SIGMA=8.0,TOP_K_PCT=0.001 test.sh
 # sbatch --export=ALL,CATEGORY=hazelnut,LOSS=l1_ssim,NUM_STAGES=5,BASE_CHANNELS=48,LATENT_DIM=128,BATCH_SIZE=16,EPOCHS=200,GAUSSIAN_SIGMA=12.0,TOP_K_PCT=0.001 test.sh
@@ -46,6 +46,9 @@ fi
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export PYTHONUNBUFFERED=1
+
+echo "[0/2] Verifying PyTorch CUDA availability..."
+"${PYTHON_RUN[@]}" -c "import torch; print(f'torch={torch.__version__} cuda={torch.version.cuda} available={torch.cuda.is_available()}'); assert torch.cuda.is_available(), 'CUDA unavailable in PyTorch; run uv sync to install cu126 wheels compatible with NVIDIA driver 560.x'"
 
 echo "[1/2] Running pipeline smoke tests..."
 "${PYTEST_RUN[@]}" -q

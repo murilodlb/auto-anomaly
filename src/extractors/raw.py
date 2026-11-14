@@ -48,6 +48,21 @@ class RawPixelExtractor:
         """Whether extracted tensors lie in [0.0, 1.0]."""
         return self._mean is None and self._std is None
 
+    def normalize_uint8_tensor(self, tensor_nchw_u8: torch.Tensor) -> torch.Tensor:
+        """Normalize an on-device (B, C, H, W) uint8 tensor into float32 (channels_last on CUDA)."""
+        mem_fmt = torch.channels_last if self.device.type == "cuda" else torch.contiguous_format
+        tensor = tensor_nchw_u8.to(
+            device=self.device,
+            dtype=torch.float32,
+            memory_format=mem_fmt,
+        )
+        tensor.div_(255.0)
+
+        if self._mean is not None and self._std is not None:
+            tensor = (tensor - self._mean) / self._std
+
+        return tensor
+
     def extract_batch(self, batch_images: np.ndarray) -> torch.Tensor:
         """Convert (B, H, W, C) uint8 numpy batch to (B, C, H, W) float32 tensor on device."""
         if batch_images.ndim != 4 or batch_images.shape[-1] != self.out_channels:
@@ -56,19 +71,8 @@ class RawPixelExtractor:
             )
 
         contiguous = np.ascontiguousarray(batch_images)
-        tensor = (
-            torch.from_numpy(contiguous)
-            .to(device=self.device, non_blocking=True)
-            .permute(0, 3, 1, 2)
-            .to(dtype=torch.float32)
-            .contiguous()
-        )
-        tensor.div_(255.0)
-
-        if self._mean is not None and self._std is not None:
-            tensor = (tensor - self._mean) / self._std
-
-        return tensor
+        tensor_u8 = torch.from_numpy(contiguous).to(device=self.device, non_blocking=True)
+        return self.normalize_uint8_tensor(tensor_u8.permute(0, 3, 1, 2))
 
     def to_uint8_images(self, tensor: torch.Tensor) -> np.ndarray:
         """Convert a (B, C, H, W) float tensor back to (B, H, W, C) uint8 numpy images."""
