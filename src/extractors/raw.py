@@ -58,8 +58,9 @@ class RawPixelExtractor:
         contiguous = np.ascontiguousarray(batch_images)
         tensor = (
             torch.from_numpy(contiguous)
-            .to(device=self.device, dtype=torch.float32)
+            .to(device=self.device, non_blocking=True)
             .permute(0, 3, 1, 2)
+            .to(dtype=torch.float32)
             .contiguous()
         )
         tensor.div_(255.0)

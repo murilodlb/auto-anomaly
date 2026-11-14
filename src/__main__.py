@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from src.config import PipelineConfig
+from src.config import VALID_LOSS_TYPES, PipelineConfig
 from src.extractors import EXTRACTOR_NAMES
 from src.models import MODEL_NAMES
 from src.run import run_pipeline
@@ -17,7 +17,13 @@ def build_parser() -> argparse.ArgumentParser:
         description="Data-Oriented Anomaly Detection Pipeline (MVTec AD)",
     )
     parser.add_argument("--data-dir", type=str, default="data", help="Root dataset directory")
-    parser.add_argument("-c", "--category", type=str, default="carpet", help="MVTec AD category")
+    parser.add_argument(
+        "-c",
+        "--category",
+        type=str,
+        default="carpet",
+        help="MVTec AD category name, or 'all' to evaluate all categories in --data-dir",
+    )
     parser.add_argument(
         "-e",
         "--extractor",
@@ -50,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--loss",
         type=str,
-        choices=["l1", "l2", "smooth_l1"],
+        choices=sorted(VALID_LOSS_TYPES),
         default="l2",
         help="Reconstruction loss function",
     )
@@ -76,6 +82,63 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-vis", action="store_true", help="Disable diagnostic plots/heatmaps")
     parser.add_argument("--device", type=str, default="cuda", help="Compute device (cuda or cpu)")
     parser.add_argument("--seed", type=int, default=42, help="Deterministic random seed")
+    parser.add_argument(
+        "--full-res",
+        action="store_true",
+        help="Use native category image resolution (aligned to 2**num_stages)",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+        help="Number of parallel image decoding threads",
+    )
+    parser.add_argument(
+        "--base-channels",
+        type=int,
+        default=32,
+        help="Base channel width of the first encoder stage",
+    )
+    parser.add_argument(
+        "--num-stages",
+        type=int,
+        default=4,
+        help="Number of stride-2 encoder/decoder stages",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1e-5,
+        help="AdamW weight decay",
+    )
+    parser.add_argument(
+        "--gaussian-sigma",
+        type=float,
+        default=4.0,
+        help="Gaussian blur sigma for anomaly map smoothing",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="results",
+        help="Base directory for experiment outputs",
+    )
+    parser.add_argument(
+        "--no-amp",
+        action="store_true",
+        help="Disable automatic mixed precision (bfloat16) on CUDA",
+    )
+    parser.add_argument(
+        "--pro-limit",
+        type=float,
+        default=0.3,
+        help="FPR integration limit in (0.0, 1.0] for official MVTec AU-PRO",
+    )
+    parser.add_argument(
+        "--save-tiff",
+        action="store_true",
+        help="Export native-resolution .tiff anomaly maps compatible with official MVTec evaluator",
+    )
     return parser
 
 

@@ -9,20 +9,57 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 from src.config import AutoencoderConfig
 from src.dataset import iter_batches
 
+
+def _l1_ssim_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Combined L1 + SSIM loss (0.2 * L1 + 0.8 * (1 - SSIM)) for sharp textures."""
+    l1 = torch.nn.functional.l1_loss(x_hat, x)
+    ssim_err = 1.0 - _ssim_map(x_hat, x).mean()
+    return 0.2 * l1 + 0.8 * ssim_err
+
+
 _LOSS_FUNCTIONS = {
-    "l1": F.l1_loss,
-    "l2": F.mse_loss,
-    "smooth_l1": F.smooth_l1_loss,
+    "l1": torch.nn.functional.l1_loss,
+    "l2": torch.nn.functional.mse_loss,
+    "smooth_l1": torch.nn.functional.smooth_l1_loss,
+    "l1_ssim": _l1_ssim_loss,
 }
 
 
-class ConvAutoencoder(nn.Module):
+def _ssim_map(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.Tensor:
+    """Compute per-pixel (B, C, H, W) Structural Similarity (SSIM) map in [0, 1]."""
+    x_f32 = x.float()
+    y_f32 = y.float()
+    c1 = 0.01**2
+    c2 = 0.03**2
+    pad = window_size // 2
+
+    mu_x = torch.nn.functional.avg_pool2d(x_f32, window_size, stride=1, padding=pad)
+    mu_y = torch.nn.functional.avg_pool2d(y_f32, window_size, stride=1, padding=pad)
+
+    mu_x_sq = mu_x.pow(2)
+    mu_y_sq = mu_y.pow(2)
+    mu_xy = mu_x * mu_y
+
+    sigma_x_sq = (
+        torch.nn.functional.avg_pool2d(x_f32 * x_f32, window_size, stride=1, padding=pad) - mu_x_sq
+    ).clamp(min=0.0)
+    sigma_y_sq = (
+        torch.nn.functional.avg_pool2d(y_f32 * y_f32, window_size, stride=1, padding=pad) - mu_y_sq
+    ).clamp(min=0.0)
+    sigma_xy = (
+        torch.nn.functional.avg_pool2d(x_f32 * y_f32, window_size, stride=1, padding=pad) - mu_xy
+    )
+
+    ssim_n = (2.0 * mu_xy + c1) * (2.0 * sigma_xy + c2)
+    ssim_d = (mu_x_sq + mu_y_sq + c1) * (sigma_x_sq + sigma_y_sq + c2)
+    return ((ssim_n / ssim_d) + 1.0).mul(0.5).clamp(0.0, 1.0)
+
+
+class ConvAutoencoder(torch.nn.Module):
     """Symmetric fully-convolutional 2D autoencoder operating on (B, C, H, W) tensors."""
 
     def __init__(
@@ -45,49 +82,51 @@ class ConvAutoencoder(nn.Module):
 
         stage_channels = [min(base_channels * (2**i), 512) for i in range(num_stages)]
 
-        enc_layers: list[nn.Module] = []
+        enc_layers: list[torch.nn.Module] = []
         ch_in = in_channels
         for ch_out in stage_channels:
             enc_layers.extend(
                 [
-                    nn.Conv2d(ch_in, ch_out, kernel_size=4, stride=2, padding=1, bias=False),
-                    nn.BatchNorm2d(ch_out),
-                    nn.LeakyReLU(0.2, inplace=True),
+                    torch.nn.Conv2d(ch_in, ch_out, kernel_size=4, stride=2, padding=1, bias=False),
+                    torch.nn.BatchNorm2d(ch_out),
+                    torch.nn.LeakyReLU(0.2, inplace=True),
                 ]
             )
             ch_in = ch_out
         enc_layers.extend(
             [
-                nn.Conv2d(ch_in, latent_dim, kernel_size=1, bias=True),
-                nn.LeakyReLU(0.2, inplace=True),
+                torch.nn.Conv2d(ch_in, latent_dim, kernel_size=1, bias=True),
+                torch.nn.LeakyReLU(0.2, inplace=True),
             ]
         )
-        self.encoder = nn.Sequential(*enc_layers)
+        self.encoder = torch.nn.Sequential(*enc_layers)
 
-        dec_layers: list[nn.Module] = [
-            nn.Conv2d(latent_dim, stage_channels[-1], kernel_size=1, bias=False),
-            nn.BatchNorm2d(stage_channels[-1]),
-            nn.ReLU(inplace=True),
+        dec_layers: list[torch.nn.Module] = [
+            torch.nn.Conv2d(latent_dim, stage_channels[-1], kernel_size=1, bias=False),
+            torch.nn.BatchNorm2d(stage_channels[-1]),
+            torch.nn.ReLU(inplace=True),
         ]
         for idx in range(num_stages - 1, 0, -1):
             c_in = stage_channels[idx]
             c_out = stage_channels[idx - 1]
             dec_layers.extend(
                 [
-                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-                    nn.Conv2d(c_in, c_out, kernel_size=3, padding=1, bias=False),
-                    nn.BatchNorm2d(c_out),
-                    nn.ReLU(inplace=True),
+                    torch.nn.ConvTranspose2d(
+                        c_in, c_out, kernel_size=4, stride=2, padding=1, bias=False
+                    ),
+                    torch.nn.BatchNorm2d(c_out),
+                    torch.nn.LeakyReLU(0.2, inplace=True),
                 ]
             )
         dec_layers.extend(
             [
-                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-                nn.Conv2d(stage_channels[0], in_channels, kernel_size=3, padding=1, bias=True),
-                nn.Sigmoid() if use_sigmoid else nn.Identity(),
+                torch.nn.ConvTranspose2d(
+                    stage_channels[0], in_channels, kernel_size=4, stride=2, padding=1, bias=True
+                ),
+                torch.nn.Sigmoid() if use_sigmoid else torch.nn.Identity(),
             ]
         )
-        self.decoder = nn.Sequential(*dec_layers)
+        self.decoder = torch.nn.Sequential(*dec_layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         z = self.encoder(x)
@@ -99,7 +138,7 @@ def _gaussian_blur_2d(tensor: torch.Tensor, sigma: float) -> torch.Tensor:
     if sigma <= 0.0:
         return tensor
 
-    radius = max(1, int(math.ceil(3.0 * sigma)))
+    radius = max(1, math.ceil(3.0 * sigma))
     coords = torch.arange(-radius, radius + 1, dtype=tensor.dtype, device=tensor.device)
     kernel_1d = torch.exp(-0.5 * (coords / sigma) ** 2)
     kernel_1d = kernel_1d / kernel_1d.sum()
@@ -109,9 +148,9 @@ def _gaussian_blur_2d(tensor: torch.Tensor, sigma: float) -> torch.Tensor:
 
     min_dim = min(tensor.shape[-2], tensor.shape[-1])
     pad_mode = "reflect" if radius < min_dim else "replicate"
-    padded = F.pad(tensor, (radius, radius, radius, radius), mode=pad_mode)
-    blurred = F.conv2d(padded, kernel_x)
-    return F.conv2d(blurred, kernel_y)
+    padded = torch.nn.functional.pad(tensor, (radius, radius, radius, radius), mode=pad_mode)
+    blurred = torch.nn.functional.conv2d(padded, kernel_x)
+    return torch.nn.functional.conv2d(blurred, kernel_y)
 
 
 class RawAutoencoderModel:
@@ -151,13 +190,21 @@ class RawAutoencoderModel:
             lr=self.config.lr,
             weight_decay=self.config.weight_decay,
         )
+        _ = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.config.epochs,
+            eta_min=self.config.lr * 0.05,
+        )
         num_samples = len(train_images)
         epoch_losses: list[float] = []
+        use_amp = (
+            self.config.use_amp and self.device.type == "cuda" and torch.cuda.is_bf16_supported()
+        )
 
         self.net.train()
         for epoch in range(1, self.config.epochs + 1):
             t0 = time.perf_counter()
-            running_loss = 0.0
+            running_loss = torch.zeros((), dtype=torch.float64, device=self.device)
 
             for batch_np in iter_batches(
                 train_images,
@@ -167,18 +214,20 @@ class RawAutoencoderModel:
             ):
                 x = extractor.extract_batch(batch_np)
                 optimizer.zero_grad(set_to_none=True)
-                x_hat = self.net(x)
-                loss = self._loss_fn(x_hat, x)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    x_hat = self.net(x)
+                    loss = self._loss_fn(x_hat, x)
                 loss.backward()
                 optimizer.step()
-                running_loss += float(loss.item()) * len(batch_np)
+                running_loss += loss.detach().to(torch.float64) * len(batch_np)
 
-            avg_loss = running_loss / max(1, num_samples)
+            avg_loss = float(running_loss.item()) / max(1, num_samples)
             epoch_losses.append(avg_loss)
             elapsed = time.perf_counter() - t0
             print(
                 f"Epoch [{epoch:03d}/{self.config.epochs:03d}] "
-                f"loss={avg_loss:.6f} ({elapsed:.2f}s)"
+                f"loss={avg_loss:.6f} ({elapsed:.2f}s)",
+                flush=True,
             )
 
         return epoch_losses
@@ -195,9 +244,16 @@ class RawAutoencoderModel:
             x = extractor.extract_batch(batch_images)
             x_hat = self.net(x)
 
-            err_map = ((x - x_hat) ** 2).mean(dim=1, keepdim=True)
+            if self.config.loss_type == "l1_ssim":
+                l1_map = (x - x_hat).abs().mean(dim=1, keepdim=True)
+                ssim_err_map = (1.0 - _ssim_map(x_hat, x)).mean(dim=1, keepdim=True)
+                err_map = 0.2 * l1_map + 0.8 * ssim_err_map
+            elif self.config.loss_type == "l1":
+                err_map = (x - x_hat).abs().mean(dim=1, keepdim=True)
+            else:
+                err_map = ((x - x_hat) ** 2).mean(dim=1, keepdim=True)
             if err_map.shape[-2:] != target_hw:
-                err_map = F.interpolate(
+                err_map = torch.nn.functional.interpolate(
                     err_map,
                     size=target_hw,
                     mode="bilinear",
@@ -207,7 +263,7 @@ class RawAutoencoderModel:
             err_map = _gaussian_blur_2d(err_map, self.config.gaussian_sigma)
 
             flat = err_map.flatten(start_dim=1)
-            k = max(1, int(math.ceil(flat.shape[1] * self.config.score_top_k_pct)))
+            k = max(1, math.ceil(flat.shape[1] * self.config.score_top_k_pct))
             top_vals = torch.topk(flat, k=k, dim=1).values
             image_scores = top_vals.mean(dim=1)
 

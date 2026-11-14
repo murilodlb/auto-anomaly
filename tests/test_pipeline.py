@@ -9,6 +9,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytest
+import tifffile
 import torch
 
 from src.config import (
@@ -20,7 +21,13 @@ from src.config import (
 )
 from src.dataset import iter_batches, load_mvtec_category
 from src.extractors.raw import RawPixelExtractor
-from src.metrics import compute_metrics
+from src.metrics import (
+    compute_au_pro,
+    compute_classification_roc,
+    compute_metrics,
+    compute_pro_curve,
+    trapezoid,
+)
 from src.models.autoencoder import ConvAutoencoder, RawAutoencoderModel
 from src.run import run_pipeline
 
@@ -165,6 +172,9 @@ def test_compute_metrics() -> None:
     amaps[2:, 2:6, 2:6] = 0.95
 
     m = compute_metrics(labels, scores, masks, amaps, ["good", "good", "hole", "hole"])
+    assert m["au_pro"] == pytest.approx(1.0)
+    assert m["pro_integration_limit"] == pytest.approx(0.3)
+    assert m["classification_au_roc_max"] == pytest.approx(1.0)
     assert m["image_auroc"] == pytest.approx(1.0)
     assert m["image_ap"] == pytest.approx(1.0)
     assert m["f1_max"] == pytest.approx(1.0)
@@ -173,6 +183,41 @@ def test_compute_metrics() -> None:
     assert m["per_defect"]["hole"]["count"] == 2
     assert m["per_defect"]["hole"]["recall_at_opt_th"] == pytest.approx(1.0)
     assert m["per_defect"]["hole"]["image_auroc"] == pytest.approx(1.0)
+    assert m["per_defect"]["hole"]["au_pro"] == pytest.approx(1.0)
+
+
+def test_official_pro_and_roc_parity() -> None:
+    # Verify trapezoid linear interpolation at x_max=0.3
+    x = np.array([0.0, 0.2, 0.4, 1.0])
+    y = np.array([0.0, 0.6, 0.8, 1.0])
+    # y(0.3) = 0.7 -> area = 0.5*0.2*(0+0.6) + 0.5*0.1*(0.6+0.7) = 0.06 + 0.065 = 0.125
+    assert trapezoid(x, y, x_max=0.3) == pytest.approx(0.125)
+
+    # Verify per-region equal weighting in compute_pro_curve:
+    # One small 2x2 component (score=0.9) and one large 6x6 component (score=0.1)
+    # Background pixels all have score=0.5 -> at FPR=0, PRO should equal 0.5 (1 of 2 regions)
+    gt = np.zeros((1, 16, 16), dtype=np.uint8)
+    gt[0, 0:2, 0:2] = 1
+    gt[0, 8:14, 8:14] = 1
+    amap = np.full((1, 16, 16), 0.5, dtype=np.float32)
+    amap[0, 0:2, 0:2] = 0.9
+    amap[0, 8:14, 8:14] = 0.1
+
+    fprs, pros = compute_pro_curve(amap, gt)
+    zero_fpr_pros = pros[fprs == 0.0]
+    assert float(np.max(zero_fpr_pros)) == pytest.approx(0.5)
+
+    au_pro, _, _ = compute_au_pro(amap, gt, integration_limit=0.3)
+    assert au_pro == pytest.approx(0.5)
+
+    # Verify compute_classification_roc matches official roc_curve_util behavior
+    rng = np.random.default_rng(7)
+    rand_maps = rng.random((20, 8, 8), dtype=np.float32)
+    rand_labels = np.array([0] * 10 + [1] * 10, dtype=np.int32)
+    au_roc, roc_fpr, roc_tpr = compute_classification_roc(rand_maps, rand_labels)
+    assert roc_fpr[0] == 0.0 and roc_fpr[-1] == 1.0
+    assert roc_tpr[0] == 0.0 and roc_tpr[-1] == 1.0
+    assert 0.0 <= au_roc <= 1.0
 
 
 def test_end_to_end_pipeline_and_weight_reload(tmp_path: Path) -> None:
@@ -188,7 +233,12 @@ def test_end_to_end_pipeline_and_weight_reload(tmp_path: Path) -> None:
             epochs=2,
             gaussian_sigma=1.0,
         ),
-        output=OutputConfig(base_dir=out_base, experiment_name="smoke", max_vis_samples=4),
+        output=OutputConfig(
+            base_dir=out_base,
+            experiment_name="smoke",
+            max_vis_samples=4,
+            save_tiff_maps=True,
+        ),
         device="cpu",
     )
     payload = run_pipeline(cfg)
@@ -198,13 +248,24 @@ def test_end_to_end_pipeline_and_weight_reload(tmp_path: Path) -> None:
     assert (exp_dir / "per_sample_scores.csv").is_file()
     assert (exp_dir / "loss_curve.png").is_file()
     assert (exp_dir / "score_distribution.png").is_file()
+    assert (exp_dir / "pro_roc_curves.png").is_file()
     assert (exp_dir / "weights" / "model.pt").is_file()
     assert len(list((exp_dir / "heatmaps").glob("*.png"))) == 4
+
+    tiff_good = exp_dir / "anomaly_maps" / "carpet" / "test" / "good" / "000.tiff"
+    tiff_hole = exp_dir / "anomaly_maps" / "carpet" / "test" / "hole" / "000.tiff"
+    assert tiff_good.is_file() and tiff_hole.is_file()
+    loaded_tiff = tifffile.imread(str(tiff_hole))
+    assert loaded_tiff.shape == (64, 64)
+    assert loaded_tiff.dtype == np.float32
 
     with (exp_dir / "metrics.json").open(encoding="utf-8") as f:
         saved = json.load(f)
     assert saved["num_train"] == 4
     assert saved["num_test"] == 4
+    assert "au_pro" in saved["metrics"]
+    assert "classification_au_roc_max" in saved["metrics"]
+    assert "au_pro" in saved["metrics"]["per_defect"]["hole"]
 
     with (exp_dir / "per_sample_scores.csv").open(encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
@@ -234,3 +295,36 @@ def test_end_to_end_pipeline_and_weight_reload(tmp_path: Path) -> None:
     assert reload_payload["metrics"]["image_auroc"] == pytest.approx(
         payload["metrics"]["image_auroc"]
     )
+
+
+def test_multi_category_pipeline(tmp_path: Path) -> None:
+    data_root = tmp_path / "multi_data"
+    _create_synthetic_mvtec(data_root, category="carpet")
+    _create_synthetic_mvtec(data_root, category="leather")
+    (data_root / "mvtec_ad_evaluation").mkdir(parents=True)  # should be ignored
+
+    out_base = tmp_path / "results"
+    cfg = PipelineConfig.from_args(
+        data_dir=str(data_root),
+        category="all",
+        image_size=[64, 64],
+        num_stages=3,
+        base_channels=8,
+        latent_dim=16,
+        epochs=1,
+        batch_size=2,
+        num_workers=1,
+        output="multi_smoke",
+        output_dir=str(out_base),
+        no_vis=True,
+        save_tiff=True,
+        device="cpu",
+    )
+    summary = run_pipeline(cfg)
+    assert summary["categories"] == ["carpet", "leather"]
+    assert (out_base / "multi_smoke" / "summary_metrics.json").is_file()
+    assert (out_base / "multi_smoke" / "carpet" / "metrics.json").is_file()
+    assert (out_base / "multi_smoke" / "leather" / "metrics.json").is_file()
+    assert (
+        out_base / "multi_smoke" / "anomaly_maps" / "leather" / "test" / "hole" / "000.tiff"
+    ).is_file()

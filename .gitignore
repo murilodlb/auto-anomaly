@@ -9,3 +9,9 @@ results/
 *.pth
 .DS_Store
 data/carpet/
+data/wood/
+data/leather/
+data/hazelnut/
+data/bottle/
+data/transistor/
+prompt.txt

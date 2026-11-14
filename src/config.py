@@ -6,9 +6,46 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-VALID_LOSS_TYPES = frozenset({"l1", "l2", "smooth_l1"})
+import cv2
+
+VALID_LOSS_TYPES = frozenset({"l1", "l2", "smooth_l1", "l1_ssim"})
 VALID_EXTRACTORS = frozenset({"raw"})
 VALID_MODELS = frozenset({"autoencoder"})
+MVTEC_CATEGORIES: tuple[str, ...] = (
+    "bottle",
+    "cable",
+    "capsule",
+    "carpet",
+    "grid",
+    "hazelnut",
+    "leather",
+    "metal_nut",
+    "pill",
+    "screw",
+    "tile",
+    "toothbrush",
+    "transistor",
+    "wood",
+    "zipper",
+)
+
+
+def detect_aligned_native_size(
+    category_dir: Path,
+    stride_factor: int,
+) -> tuple[int, int]:
+    """Detect native (H, W) from the first training image and align to stride_factor."""
+    train_good = category_dir / "train" / "good"
+    first_img = next(iter(sorted(train_good.glob("*.png"))), None)
+    if first_img is None:
+        raise FileNotFoundError(f"No PNG images found in {train_good} to infer native resolution")
+    img = cv2.imread(str(first_img), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError(f"Failed to decode image for native size detection: {first_img}")
+    raw_h, raw_w = int(img.shape[0]), int(img.shape[1])
+    aligned_h = max(stride_factor, (raw_h // stride_factor) * stride_factor)
+    aligned_w = max(stride_factor, (raw_w // stride_factor) * stride_factor)
+    return aligned_h, aligned_w
 
 
 @dataclass(frozen=True)
@@ -21,6 +58,7 @@ class DatasetConfig:
     grayscale: bool = False
     batch_size: int = 16
     num_workers: int = 4
+    full_res: bool = False
 
     @property
     def category_dir(self) -> Path:
@@ -89,6 +127,7 @@ class AutoencoderConfig:
     weight_decay: float = 1e-5
     score_top_k_pct: float = 0.01
     gaussian_sigma: float = 4.0
+    use_amp: bool = True
     save_weights: bool = True
     load_weights: Path | None = None
 
@@ -101,6 +140,7 @@ class OutputConfig:
     experiment_name: str = "carpet_raw_ae"
     save_visualizations: bool = True
     max_vis_samples: int = 25
+    save_tiff_maps: bool = False
 
     @property
     def output_dir(self) -> Path:
@@ -114,6 +154,23 @@ class OutputConfig:
     def weights_dir(self) -> Path:
         return self.output_dir / "weights"
 
+    @property
+    def anomaly_maps_dir(self) -> Path:
+        return self.output_dir / "anomaly_maps"
+
+
+def discover_mvtec_categories(root_dir: Path) -> list[str]:
+    """Return sorted valid MVTec AD category names present under root_dir."""
+    if not root_dir.is_dir():
+        return []
+    categories: list[str] = []
+    for entry in sorted(root_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        if (entry / "train" / "good").is_dir() and (entry / "test").is_dir():
+            categories.append(entry.name)
+    return categories
+
 
 @dataclass(frozen=True)
 class PipelineConfig:
@@ -125,20 +182,33 @@ class PipelineConfig:
     extractors: ExtractorsConfig = field(default_factory=ExtractorsConfig)
     autoencoder: AutoencoderConfig = field(default_factory=AutoencoderConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    pro_integration_limit: float = 0.3
     seed: int = 42
     device: str = "cuda"
 
     def validate(self) -> None:
         """Validate directory structure on disk and hyperparameter invariants."""
-        if not self.dataset.category_dir.is_dir():
-            raise FileNotFoundError(
-                f"Dataset category directory does not exist: {self.dataset.category_dir}"
-            )
-        train_good = self.dataset.train_dir / "good"
-        if not train_good.is_dir():
-            raise FileNotFoundError(f"Training 'good' directory does not exist: {train_good}")
-        if not self.dataset.test_dir.is_dir():
-            raise FileNotFoundError(f"Test directory does not exist: {self.dataset.test_dir}")
+        if self.dataset.category == "all":
+            if not self.dataset.root_dir.is_dir():
+                raise FileNotFoundError(
+                    f"Dataset root directory does not exist: {self.dataset.root_dir}"
+                )
+            if not discover_mvtec_categories(self.dataset.root_dir):
+                raise FileNotFoundError(
+                    f"No valid MVTec AD category directories found under {self.dataset.root_dir}"
+                )
+            if self.autoencoder.load_weights is not None:
+                raise ValueError("--load-weights cannot be used when --category is 'all'")
+        else:
+            if not self.dataset.category_dir.is_dir():
+                raise FileNotFoundError(
+                    f"Dataset category directory does not exist: {self.dataset.category_dir}"
+                )
+            train_good = self.dataset.train_dir / "good"
+            if not train_good.is_dir():
+                raise FileNotFoundError(f"Training 'good' directory does not exist: {train_good}")
+            if not self.dataset.test_dir.is_dir():
+                raise FileNotFoundError(f"Test directory does not exist: {self.dataset.test_dir}")
 
         if self.extractor_name not in VALID_EXTRACTORS:
             raise ValueError(
@@ -180,13 +250,16 @@ class PipelineConfig:
         if ae.weight_decay < 0.0:
             raise ValueError(f"weight_decay must be >= 0, got {ae.weight_decay}")
         if not (0.0 < ae.score_top_k_pct <= 1.0):
-            raise ValueError(
-                f"score_top_k_pct must be in (0.0, 1.0], got {ae.score_top_k_pct}"
-            )
+            raise ValueError(f"score_top_k_pct must be in (0.0, 1.0], got {ae.score_top_k_pct}")
         if ae.gaussian_sigma < 0.0:
             raise ValueError(f"gaussian_sigma must be >= 0, got {ae.gaussian_sigma}")
         if ae.load_weights is not None and not ae.load_weights.is_file():
             raise FileNotFoundError(f"Checkpoint file does not exist: {ae.load_weights}")
+
+        if not (0.0 < self.pro_integration_limit <= 1.0):
+            raise ValueError(
+                f"pro_integration_limit must be in (0.0, 1.0], got {self.pro_integration_limit}"
+            )
 
         raw_cfg = self.extractors.raw
         if (raw_cfg.normalize_mean is None) != (raw_cfg.normalize_std is None):
@@ -197,25 +270,33 @@ class PipelineConfig:
                 len(raw_cfg.normalize_mean) != expected_ch
                 or len(raw_cfg.normalize_std) != expected_ch
             ):
-                raise ValueError(
-                    f"normalize_mean and normalize_std must have length {expected_ch}"
-                )
+                raise ValueError(f"normalize_mean and normalize_std must have length {expected_ch}")
             if any(s <= 0.0 for s in raw_cfg.normalize_std):
                 raise ValueError("All normalize_std entries must be strictly positive")
 
     @classmethod
     def from_args(cls, **kwargs: Any) -> PipelineConfig:
         """Construct a PipelineConfig cleanly from flat CLI keyword arguments."""
-        image_size_raw = kwargs.get("image_size", (256, 256))
-        image_size = (int(image_size_raw[0]), int(image_size_raw[1]))
+        root_dir = Path(kwargs.get("data_dir", "data"))
+        category = str(kwargs.get("category", "carpet"))
+        num_stages = int(kwargs.get("num_stages", 4))
+
+        full_res = bool(kwargs.get("full_res", False))
+        if full_res and category != "all":
+            stride_factor = 2**num_stages
+            image_size = detect_aligned_native_size(root_dir / category, stride_factor)
+        else:
+            image_size_raw = kwargs.get("image_size", (256, 256))
+            image_size = (int(image_size_raw[0]), int(image_size_raw[1]))
 
         dataset_cfg = DatasetConfig(
-            root_dir=Path(kwargs.get("data_dir", "data")),
-            category=str(kwargs.get("category", "carpet")),
+            root_dir=root_dir,
+            category=category,
             image_size=image_size,
             grayscale=bool(kwargs.get("grayscale", False)),
             batch_size=int(kwargs.get("batch_size", 16)),
             num_workers=int(kwargs.get("num_workers", 4)),
+            full_res=full_res,
         )
 
         load_weights_raw = kwargs.get("load_weights")
@@ -224,13 +305,14 @@ class PipelineConfig:
         ae_cfg = AutoencoderConfig(
             latent_dim=int(kwargs.get("latent_dim", 128)),
             base_channels=int(kwargs.get("base_channels", 32)),
-            num_stages=int(kwargs.get("num_stages", 4)),
+            num_stages=num_stages,
             loss_type=str(kwargs.get("loss", "l2")),
             epochs=int(kwargs.get("epochs", 50)),
             lr=float(kwargs.get("lr", 1e-3)),
             weight_decay=float(kwargs.get("weight_decay", 1e-5)),
             score_top_k_pct=float(kwargs.get("top_k_pct", 0.01)),
             gaussian_sigma=float(kwargs.get("gaussian_sigma", 4.0)),
+            use_amp=not bool(kwargs.get("no_amp", False)),
             save_weights=not bool(kwargs.get("no_save_weights", False)),
             load_weights=load_weights,
         )
@@ -240,6 +322,7 @@ class PipelineConfig:
             experiment_name=str(kwargs.get("output", "carpet_raw_ae")),
             save_visualizations=not bool(kwargs.get("no_vis", False)),
             max_vis_samples=int(kwargs.get("max_vis_samples", 25)),
+            save_tiff_maps=bool(kwargs.get("save_tiff", False)),
         )
 
         return cls(
@@ -248,6 +331,7 @@ class PipelineConfig:
             model_name=str(kwargs.get("model", "autoencoder")),
             autoencoder=ae_cfg,
             output=output_cfg,
+            pro_integration_limit=float(kwargs.get("pro_limit", 0.3)),
             seed=int(kwargs.get("seed", 42)),
             device=str(kwargs.get("device", "cuda")),
         )

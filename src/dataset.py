@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -22,14 +22,15 @@ class MVTecSplit:
     masks: np.ndarray
     labels: np.ndarray
     defect_types: list[str]
+    original_sizes: list[tuple[int, int]] = field(default_factory=list)
 
 
 def _read_and_resize_image(
     path: Path,
     target_hw: tuple[int, int],
     grayscale: bool,
-) -> np.ndarray:
-    """Load an image from disk and resize it to (H, W, C) uint8."""
+) -> tuple[np.ndarray, tuple[int, int]]:
+    """Load an image from disk and return ((H, W, C) uint8, (src_h, src_w))."""
     flag = cv2.IMREAD_GRAYSCALE if grayscale else cv2.IMREAD_COLOR
     raw = cv2.imread(str(path), flag)
     if raw is None:
@@ -38,7 +39,7 @@ def _read_and_resize_image(
     if not grayscale:
         raw = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
 
-    src_h, src_w = raw.shape[:2]
+    src_h, src_w = int(raw.shape[0]), int(raw.shape[1])
     dst_h, dst_w = target_hw
     if (src_h, src_w) != (dst_h, dst_w):
         interp = cv2.INTER_AREA if (src_h > dst_h or src_w > dst_w) else cv2.INTER_LINEAR
@@ -47,7 +48,7 @@ def _read_and_resize_image(
     if grayscale and raw.ndim == 2:
         raw = raw[:, :, None]
 
-    return np.ascontiguousarray(raw, dtype=np.uint8)
+    return np.ascontiguousarray(raw, dtype=np.uint8), (src_h, src_w)
 
 
 def _read_and_resize_mask(path: Path, target_hw: tuple[int, int]) -> np.ndarray:
@@ -77,23 +78,26 @@ def _load_split(
     labels = np.array([rec[2] for rec in records], dtype=np.int32)
     images = np.empty((n, h, w, c), dtype=np.uint8)
     masks = np.zeros((n, h, w), dtype=np.uint8)
+    original_sizes: list[tuple[int, int]] = [(0, 0)] * n
 
-    def _load_one(idx: int) -> tuple[int, np.ndarray, np.ndarray | None]:
+    def _load_one(idx: int) -> tuple[int, np.ndarray, np.ndarray | None, tuple[int, int]]:
         img_path, mask_path, _, _ = records[idx]
-        img = _read_and_resize_image(img_path, (h, w), config.grayscale)
+        img, orig_hw = _read_and_resize_image(img_path, (h, w), config.grayscale)
         mask = _read_and_resize_mask(mask_path, (h, w)) if mask_path is not None else None
-        return idx, img, mask
+        return idx, img, mask, orig_hw
 
     if config.num_workers > 1 and n > 1:
         with ThreadPoolExecutor(max_workers=config.num_workers) as pool:
-            for idx, img, mask in pool.map(_load_one, range(n)):
+            for idx, img, mask, orig_hw in pool.map(_load_one, range(n)):
                 images[idx] = img
+                original_sizes[idx] = orig_hw
                 if mask is not None:
                     masks[idx] = mask
     else:
         for idx in range(n):
-            _, img, mask = _load_one(idx)
+            _, img, mask, orig_hw = _load_one(idx)
             images[idx] = img
+            original_sizes[idx] = orig_hw
             if mask is not None:
                 masks[idx] = mask
 
@@ -103,6 +107,7 @@ def _load_split(
         masks=np.ascontiguousarray(masks),
         labels=np.ascontiguousarray(labels),
         defect_types=defect_types,
+        original_sizes=original_sizes,
     )
 
 
