@@ -8,3 +8,4 @@ results/
 *.pt
 *.pth
 .DS_Store
+data/carpet/
