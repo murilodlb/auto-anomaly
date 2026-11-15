@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import random
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -14,20 +15,14 @@ import torch
 from src.config import AutoencoderConfig
 from src.dataset import iter_batches
 
-
-def _l1_ssim_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """Combined L1 + SSIM loss (0.2 * L1 + 0.8 * (1 - SSIM)) for sharp textures."""
-    l1 = torch.nn.functional.l1_loss(x_hat, x)
-    ssim_err = 1.0 - _ssim_map(x_hat, x).mean()
-    return 0.2 * l1 + 0.8 * ssim_err
+_MAX_GPU_STAGE_BYTES = 8 * 1024**3
 
 
-_LOSS_FUNCTIONS = {
-    "l1": torch.nn.functional.l1_loss,
-    "l2": torch.nn.functional.mse_loss,
-    "smooth_l1": torch.nn.functional.smooth_l1_loss,
-    "l1_ssim": _l1_ssim_loss,
-}
+def _separable_avg_pool2d(t: torch.Tensor, window_size: int = 11) -> torch.Tensor:
+    """Apply fast separable 1D box pooling equivalent to 2D avg_pool2d."""
+    pad = window_size // 2
+    pooled_h = torch.nn.functional.avg_pool2d(t, (window_size, 1), stride=1, padding=(pad, 0))
+    return torch.nn.functional.avg_pool2d(pooled_h, (1, window_size), stride=1, padding=(0, pad))
 
 
 def _ssim_map(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.Tensor:
@@ -36,32 +31,171 @@ def _ssim_map(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.
     y_f32 = y.float()
     c1 = 0.01**2
     c2 = 0.03**2
-    pad = window_size // 2
 
-    mu_x = torch.nn.functional.avg_pool2d(x_f32, window_size, stride=1, padding=pad)
-    mu_y = torch.nn.functional.avg_pool2d(y_f32, window_size, stride=1, padding=pad)
+    mu_x = _separable_avg_pool2d(x_f32, window_size)
+    mu_y = _separable_avg_pool2d(y_f32, window_size)
 
     mu_x_sq = mu_x.pow(2)
     mu_y_sq = mu_y.pow(2)
     mu_xy = mu_x * mu_y
 
-    sigma_x_sq = (
-        torch.nn.functional.avg_pool2d(x_f32 * x_f32, window_size, stride=1, padding=pad) - mu_x_sq
-    ).clamp(min=0.0)
-    sigma_y_sq = (
-        torch.nn.functional.avg_pool2d(y_f32 * y_f32, window_size, stride=1, padding=pad) - mu_y_sq
-    ).clamp(min=0.0)
-    sigma_xy = (
-        torch.nn.functional.avg_pool2d(x_f32 * y_f32, window_size, stride=1, padding=pad) - mu_xy
-    )
+    sigma_x_sq = (_separable_avg_pool2d(x_f32 * x_f32, window_size) - mu_x_sq).clamp(min=0.0)
+    sigma_y_sq = (_separable_avg_pool2d(y_f32 * y_f32, window_size) - mu_y_sq).clamp(min=0.0)
+    sigma_xy = _separable_avg_pool2d(x_f32 * y_f32, window_size) - mu_xy
 
     ssim_n = (2.0 * mu_xy + c1) * (2.0 * sigma_xy + c2)
     ssim_d = (mu_x_sq + mu_y_sq + c1) * (sigma_x_sq + sigma_y_sq + c2)
     return ((ssim_n / ssim_d) + 1.0).mul(0.5).clamp(0.0, 1.0)
 
 
+def _iter_ssim_error_scales(x_hat: torch.Tensor, x: torch.Tensor) -> list[torch.Tensor]:
+    """Return per-pixel (B, 1, H_s, W_s) (1 - SSIM) maps at 1.0x, 0.5x, and 0.25x scales."""
+    h, w = x.shape[-2], x.shape[-1]
+    maps: list[torch.Tensor] = []
+    for scale in (1, 2, 4):
+        if min(h, w) < scale:
+            continue
+        if scale == 1:
+            xh_s, x_s = x_hat, x
+        else:
+            xh_s = torch.nn.functional.avg_pool2d(x_hat.float(), kernel_size=scale)
+            x_s = torch.nn.functional.avg_pool2d(x.float(), kernel_size=scale)
+        maps.append((1.0 - _ssim_map(xh_s, x_s)).mean(dim=1, keepdim=True))
+    return maps
+
+
+def _l1_ssim_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Combined L1 + SSIM loss (0.2 * L1 + 0.8 * (1 - SSIM)) for sharp textures."""
+    l1 = torch.nn.functional.l1_loss(x_hat.float(), x.float())
+    ssim_err = 1.0 - _ssim_map(x_hat, x).mean()
+    return 0.2 * l1 + 0.8 * ssim_err
+
+
+def _ms_l1_ssim_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Multi-scale L1 + SSIM loss across 1.0x, 0.5x, and 0.25x spatial resolutions."""
+    l1 = torch.nn.functional.l1_loss(x_hat.float(), x.float())
+    scale_errs = [s.mean() for s in _iter_ssim_error_scales(x_hat, x)]
+    ssim_err = torch.stack(scale_errs).mean()
+    return 0.2 * l1 + 0.8 * ssim_err
+
+
+_LOSS_FUNCTIONS = {
+    "l1": torch.nn.functional.l1_loss,
+    "l2": torch.nn.functional.mse_loss,
+    "smooth_l1": torch.nn.functional.smooth_l1_loss,
+    "l1_ssim": _l1_ssim_loss,
+    "ms_l1_ssim": _ms_l1_ssim_loss,
+}
+
+
+def _compute_raw_error_map(x_hat: torch.Tensor, x: torch.Tensor, loss_type: str) -> torch.Tensor:
+    """Compute per-pixel (B, 1, H, W) reconstruction error map in float32."""
+    x_hat_f32 = x_hat.float()
+    x_f32 = x.float()
+    if loss_type == "l1":
+        return (x_f32 - x_hat_f32).abs().mean(dim=1, keepdim=True)
+    if loss_type == "smooth_l1":
+        return torch.nn.functional.smooth_l1_loss(
+            x_hat_f32, x_f32, reduction="none"
+        ).mean(dim=1, keepdim=True)
+    if loss_type == "l1_ssim":
+        l1_map = (x_f32 - x_hat_f32).abs().mean(dim=1, keepdim=True)
+        ssim_err_map = (1.0 - _ssim_map(x_hat_f32, x_f32)).mean(dim=1, keepdim=True)
+        return 0.2 * l1_map + 0.8 * ssim_err_map
+    if loss_type == "ms_l1_ssim":
+        l1_map = (x_f32 - x_hat_f32).abs().mean(dim=1, keepdim=True)
+        target_hw = (x_f32.shape[-2], x_f32.shape[-1])
+        upsampled_scales = [
+            s
+            if s.shape[-2:] == target_hw
+            else torch.nn.functional.interpolate(
+                s, size=target_hw, mode="bilinear", align_corners=False
+            )
+            for s in _iter_ssim_error_scales(x_hat_f32, x_f32)
+        ]
+        ssim_err_map = torch.stack(upsampled_scales, dim=0).mean(dim=0)
+        return 0.2 * l1_map + 0.8 * ssim_err_map
+    return ((x_f32 - x_hat_f32) ** 2).mean(dim=1, keepdim=True)
+
+
+def _corrupt_batch(
+    x: torch.Tensor,
+    denoise_prob: float,
+    seed: int | None = None,
+) -> torch.Tensor:
+    """Apply CutPaste, streak, jitter, and Gaussian noise corruptions for denoising training."""
+    if denoise_prob <= 0.0 or x.numel() == 0:
+        return x
+
+    b, c, h, w = x.shape
+    x_noisy = x.clone()
+    device = x.device
+    dtype = x.dtype
+    rng = random.Random(seed)
+    torch_gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
+
+    # Keep dynamic range bounds on-device so CUDA training never stalls on scalar syncs.
+    x_min_t = x.amin()
+    x_max_t = x.amax()
+    val_span_t = (x_max_t - x_min_t).clamp(min=1e-3)
+
+    min_log_ar = math.log(0.15)
+    max_log_ar = math.log(6.5)
+
+    for i in range(b):
+        if rng.random() >= denoise_prob:
+            continue
+        num_patches = rng.randint(1, 3)
+        for _ in range(num_patches):
+            target_area = rng.uniform(0.01, 0.08) * float(h * w)
+            aspect = math.exp(rng.uniform(min_log_ar, max_log_ar))
+            ph = min(h, max(2, round(math.sqrt(target_area * aspect))))
+            pw = min(w, max(2, round(math.sqrt(target_area / aspect))))
+
+            y0 = rng.randint(0, max(0, h - ph))
+            x0 = rng.randint(0, max(0, w - pw))
+            mode = rng.randint(0, 2)
+
+            if mode == 0:
+                streak_mode = rng.randint(0, 2)
+                region = x_noisy[i, :, y0 : y0 + ph, x0 : x0 + pw]
+                if streak_mode == 0:
+                    scale = rng.uniform(0.1, 0.4)
+                    patch = region * scale - 0.1 * val_span_t
+                elif streak_mode == 1:
+                    delta = rng.uniform(0.25, 0.75) * val_span_t
+                    patch = region + delta
+                else:
+                    jitter = (
+                        torch.rand((c, 1, 1), device=device, dtype=dtype, generator=torch_gen)
+                        - 0.5
+                    ) * (0.8 * val_span_t)
+                    patch = region + jitter
+            elif mode == 1:
+                src_i = rng.randrange(b)
+                sy0 = rng.randint(0, max(0, h - ph))
+                sx0 = rng.randint(0, max(0, w - pw))
+                patch = x[src_i, :, sy0 : sy0 + ph, sx0 : sx0 + pw].clone()
+            else:
+                sigma = rng.uniform(0.15, 0.45) * val_span_t
+                noise = torch.randn(
+                    (c, ph, pw), device=device, dtype=dtype, generator=torch_gen
+                )
+                patch = x_noisy[i, :, y0 : y0 + ph, x0 : x0 + pw] + noise * sigma
+
+            x_noisy[i, :, y0 : y0 + ph, x0 : x0 + pw] = patch.clamp(x_min_t, x_max_t)
+
+    return x_noisy
+
+
 class ConvAutoencoder(torch.nn.Module):
     """Symmetric fully-convolutional 2D autoencoder operating on (B, C, H, W) tensors."""
+
+    err_mean: torch.Tensor
+    err_std: torch.Tensor
+    calibrated: torch.Tensor
+    normal_mu_map: torch.Tensor
+    normal_std_map: torch.Tensor
 
     def __init__(
         self,
@@ -69,17 +203,27 @@ class ConvAutoencoder(torch.nn.Module):
         base_channels: int = 32,
         latent_dim: int = 128,
         num_stages: int = 4,
+        spatial_dropout: float = 0.1,
         use_sigmoid: bool = True,
     ) -> None:
         super().__init__()
         if num_stages < 1:
             raise ValueError(f"num_stages must be >= 1, got {num_stages}")
+        if not (0.0 <= spatial_dropout < 1.0):
+            raise ValueError(f"spatial_dropout must be in [0.0, 1.0), got {spatial_dropout}")
 
         self.in_channels = in_channels
         self.base_channels = base_channels
         self.latent_dim = latent_dim
         self.num_stages = num_stages
+        self.spatial_dropout = spatial_dropout
         self.use_sigmoid = use_sigmoid
+
+        self.register_buffer("err_mean", torch.zeros(1, dtype=torch.float32))
+        self.register_buffer("err_std", torch.ones(1, dtype=torch.float32))
+        self.register_buffer("calibrated", torch.zeros(1, dtype=torch.bool))
+        self.register_buffer("normal_mu_map", torch.zeros((1, 1, 16, 16), dtype=torch.float32))
+        self.register_buffer("normal_std_map", torch.ones((1, 1, 16, 16), dtype=torch.float32))
 
         stage_channels = [min(base_channels * (2**i), 512) for i in range(num_stages)]
 
@@ -96,7 +240,12 @@ class ConvAutoencoder(torch.nn.Module):
             ch_in = ch_out
         enc_layers.extend(
             [
-                torch.nn.Conv2d(ch_in, latent_dim, kernel_size=1, bias=True),
+                torch.nn.Conv2d(ch_in, latent_dim, kernel_size=3, padding=1, bias=False),
+                torch.nn.BatchNorm2d(latent_dim),
+                torch.nn.LeakyReLU(0.2, inplace=True),
+                torch.nn.Dropout2d(p=spatial_dropout),
+                torch.nn.Conv2d(latent_dim, latent_dim, kernel_size=3, padding=1, bias=False),
+                torch.nn.BatchNorm2d(latent_dim),
                 torch.nn.LeakyReLU(0.2, inplace=True),
             ]
         )
@@ -177,6 +326,7 @@ class RawAutoencoderModel:
             base_channels=config.base_channels,
             latent_dim=config.latent_dim,
             num_stages=config.num_stages,
+            spatial_dropout=config.spatial_dropout,
             use_sigmoid=use_sigmoid,
         ).to(device=device)
         if device.type == "cuda":
@@ -202,7 +352,8 @@ class RawAutoencoderModel:
             free_bytes, _ = torch.cuda.mem_get_info(self.device)
         except RuntimeError:
             return None
-        if train_images.nbytes >= int(free_bytes * 0.25):
+        max_stage_bytes = min(_MAX_GPU_STAGE_BYTES, int(free_bytes * 0.5))
+        if train_images.nbytes >= max_stage_bytes:
             return None
         return (
             torch.from_numpy(np.ascontiguousarray(train_images))
@@ -217,24 +368,125 @@ class RawAutoencoderModel:
         extractor: Any,
         train_gpu_u8: torch.Tensor | None,
         epoch: int,
+        shuffle: bool = True,
     ) -> Iterator[torch.Tensor]:
-        """Yield shuffled (B, C, H, W) float32 training batches from GPU cache or CPU."""
+        """Yield (B, C, H, W) float32 batches from GPU cache or CPU."""
         if train_gpu_u8 is not None:
             num_samples = train_gpu_u8.shape[0]
-            gen = torch.Generator(device=self.device).manual_seed(self.seed + epoch)
-            perm = torch.randperm(num_samples, device=self.device, generator=gen)
+            order = (
+                torch.randperm(
+                    num_samples,
+                    device=self.device,
+                    generator=torch.Generator(device=self.device).manual_seed(self.seed + epoch),
+                )
+                if shuffle
+                else None
+            )
             for start in range(0, num_samples, self.batch_size):
-                idx = perm[start : start + self.batch_size]
-                yield extractor.normalize_uint8_tensor(train_gpu_u8[idx])
+                batch_u8 = (
+                    train_gpu_u8[order[start : start + self.batch_size]]
+                    if order is not None
+                    else train_gpu_u8[start : start + self.batch_size]
+                )
+                yield extractor.normalize_uint8_tensor(batch_u8)
             return
 
         for batch_np in iter_batches(
             train_images,
             batch_size=self.batch_size,
-            shuffle=True,
+            shuffle=shuffle,
             seed=self.seed + epoch,
         ):
             yield extractor.extract_batch(batch_np)
+
+    def _score_batch_tensor(
+        self,
+        x: torch.Tensor,
+        target_hw: tuple[int, int] | None,
+        apply_calibration: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute reconstruction (float32) and damped/calibrated error map (B, 1, H, W)."""
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self._use_amp):
+            x_hat = self.net(x)
+        x_hat_f32 = x_hat.float()
+
+        err_map = _compute_raw_error_map(x_hat_f32, x, self.config.loss_type)
+
+        if self.config.texture_damping > 0.0:
+            mu_hat = _separable_avg_pool2d(x_hat_f32, window_size=11)
+            sq_hat = _separable_avg_pool2d(x_hat_f32 * x_hat_f32, window_size=11)
+            var_hat = (sq_hat - mu_hat * mu_hat).clamp(min=0.0)
+            texture_std = torch.sqrt(var_hat.mean(dim=1, keepdim=True).clamp(min=0.0))
+            err_map = err_map / (1.0 + self.config.texture_damping * texture_std)
+
+        if target_hw is not None and err_map.shape[-2:] != target_hw:
+            err_map = torch.nn.functional.interpolate(
+                err_map,
+                size=target_hw,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        err_map = _gaussian_blur_2d(err_map, self.config.gaussian_sigma)
+
+        if apply_calibration and bool(self.net.calibrated.item()):
+            err_map = (err_map - self.net.err_mean).clamp(min=0.0) / (self.net.err_std + 1e-4)
+
+        return x_hat_f32, err_map
+
+    def _calibrate_normal_baseline(
+        self,
+        train_images: np.ndarray,
+        extractor: Any,
+        train_gpu_u8: torch.Tensor | None,
+    ) -> None:
+        """Estimate defect-free training pixel error baseline statistics in eval mode."""
+        self.net.eval()
+        sum_err = torch.zeros((), dtype=torch.float64, device=self.device)
+        sum_err_sq = torch.zeros((), dtype=torch.float64, device=self.device)
+        spatial_sum = torch.zeros((1, 1, 16, 16), dtype=torch.float64, device=self.device)
+        spatial_sum_sq = torch.zeros((1, 1, 16, 16), dtype=torch.float64, device=self.device)
+        total_pixels = 0
+        total_images = 0
+
+        with torch.inference_mode():
+            for x in self._iter_train_batches(
+                train_images, extractor, train_gpu_u8, epoch=0, shuffle=False
+            ):
+                _, err_map = self._score_batch_tensor(x, target_hw=None, apply_calibration=False)
+                err_f64 = err_map.to(torch.float64)
+                sum_err += err_f64.sum()
+                sum_err_sq += (err_f64 * err_f64).sum()
+                total_pixels += err_map.numel()
+
+                pooled = torch.nn.functional.adaptive_avg_pool2d(err_map, (16, 16)).to(
+                    torch.float64
+                )
+                spatial_sum += pooled.sum(dim=0, keepdim=True)
+                spatial_sum_sq += (pooled * pooled).sum(dim=0, keepdim=True)
+                total_images += x.shape[0]
+
+        if total_pixels == 0 or total_images == 0:
+            return
+
+        mean_val = sum_err / float(total_pixels)
+        var_val = (sum_err_sq / float(total_pixels) - mean_val * mean_val).clamp(min=0.0)
+        std_val = torch.sqrt(var_val).clamp(min=1e-4)
+
+        sp_mean = spatial_sum / float(total_images)
+        sp_var = (spatial_sum_sq / float(total_images) - sp_mean * sp_mean).clamp(min=0.0)
+        sp_std = torch.sqrt(sp_var).clamp(min=1e-4)
+
+        self.net.err_mean.copy_(mean_val.view(1).to(torch.float32))
+        self.net.err_std.copy_(std_val.view(1).to(torch.float32))
+        self.net.normal_mu_map.copy_(sp_mean.to(torch.float32))
+        self.net.normal_std_map.copy_(sp_std.to(torch.float32))
+        self.net.calibrated.fill_(True)
+        print(
+            f"[Calibration] err_mean={float(self.net.err_mean.item()):.6f} "
+            f"err_std={float(self.net.err_std.item()):.6f}",
+            flush=True,
+        )
 
     def fit(self, train_images: np.ndarray, extractor: Any) -> list[float]:
         """Train the autoencoder on normal images and return per-epoch average losses."""
@@ -243,7 +495,7 @@ class RawAutoencoderModel:
             lr=self.config.lr,
             weight_decay=self.config.weight_decay,
         )
-        _ = torch.optim.lr_scheduler.CosineAnnealingLR(
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=self.config.epochs,
             eta_min=self.config.lr * 0.05,
@@ -252,21 +504,35 @@ class RawAutoencoderModel:
         epoch_losses: list[float] = []
         train_gpu_u8 = self._maybe_preload_train_gpu(train_images, extractor)
 
-        self.net.train()
         try:
             for epoch in range(1, self.config.epochs + 1):
+                self.net.train()
                 t0 = time.perf_counter()
                 running_loss = torch.zeros((), dtype=torch.float64, device=self.device)
 
-                for x in self._iter_train_batches(train_images, extractor, train_gpu_u8, epoch):
+                for step_idx, x in enumerate(
+                    self._iter_train_batches(
+                        train_images, extractor, train_gpu_u8, epoch, shuffle=True
+                    )
+                ):
                     optimizer.zero_grad(set_to_none=True)
+                    x_in = (
+                        _corrupt_batch(
+                            x,
+                            self.config.denoise_prob,
+                            seed=self.seed * 100003 + epoch * 1009 + step_idx,
+                        )
+                        if self.config.denoise_prob > 0.0
+                        else x
+                    )
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self._use_amp):
-                        x_hat = self.net(x)
+                        x_hat = self.net(x_in)
                         loss = self._loss_fn(x_hat, x)
                     loss.backward()
                     optimizer.step()
                     running_loss += loss.detach().to(torch.float64) * x.shape[0]
 
+                scheduler.step()
                 avg_loss = float(running_loss.item()) / max(1, num_samples)
                 epoch_losses.append(avg_loss)
                 elapsed = time.perf_counter() - t0
@@ -275,6 +541,8 @@ class RawAutoencoderModel:
                     f"loss={avg_loss:.6f} ({elapsed:.2f}s)",
                     flush=True,
                 )
+
+            self._calibrate_normal_baseline(train_images, extractor, train_gpu_u8)
         finally:
             del train_gpu_u8
 
@@ -290,27 +558,9 @@ class RawAutoencoderModel:
         self.net.eval()
         with torch.inference_mode():
             x = extractor.extract_batch(batch_images)
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self._use_amp):
-                x_hat = self.net(x)
-            x_hat = x_hat.float()
-
-            if self.config.loss_type == "l1_ssim":
-                l1_map = (x - x_hat).abs().mean(dim=1, keepdim=True)
-                ssim_err_map = (1.0 - _ssim_map(x_hat, x)).mean(dim=1, keepdim=True)
-                err_map = 0.2 * l1_map + 0.8 * ssim_err_map
-            elif self.config.loss_type == "l1":
-                err_map = (x - x_hat).abs().mean(dim=1, keepdim=True)
-            else:
-                err_map = ((x - x_hat) ** 2).mean(dim=1, keepdim=True)
-            if err_map.shape[-2:] != target_hw:
-                err_map = torch.nn.functional.interpolate(
-                    err_map,
-                    size=target_hw,
-                    mode="bilinear",
-                    align_corners=False,
-                )
-
-            err_map = _gaussian_blur_2d(err_map, self.config.gaussian_sigma)
+            x_hat, err_map = self._score_batch_tensor(
+                x, target_hw=target_hw, apply_calibration=True
+            )
 
             flat = err_map.flatten(start_dim=1)
             k = max(1, math.ceil(flat.shape[1] * self.config.score_top_k_pct))
@@ -339,6 +589,7 @@ class RawAutoencoderModel:
                 "base_channels": self.config.base_channels,
                 "latent_dim": self.config.latent_dim,
                 "num_stages": self.config.num_stages,
+                "spatial_dropout": self.net.spatial_dropout,
                 "use_sigmoid": self.net.use_sigmoid,
             },
         }

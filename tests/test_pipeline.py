@@ -12,6 +12,7 @@ import pytest
 import tifffile
 import torch
 
+from src.__main__ import build_parser
 from src.config import (
     AutoencoderConfig,
     DatasetConfig,
@@ -28,7 +29,13 @@ from src.metrics import (
     compute_pro_curve,
     trapezoid,
 )
-from src.models.autoencoder import ConvAutoencoder, RawAutoencoderModel
+from src.models.autoencoder import (
+    ConvAutoencoder,
+    RawAutoencoderModel,
+    _corrupt_batch,
+    _ms_l1_ssim_loss,
+    _ssim_map,
+)
 from src.run import run_pipeline
 
 
@@ -328,3 +335,237 @@ def test_multi_category_pipeline(tmp_path: Path) -> None:
     assert (
         out_base / "multi_smoke" / "anomaly_maps" / "leather" / "test" / "hole" / "000.tiff"
     ).is_file()
+
+
+def _naive_2d_ssim_map(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.Tensor:
+    x_f32 = x.float()
+    y_f32 = y.float()
+    c1 = 0.01**2
+    c2 = 0.03**2
+    pad = window_size // 2
+    mu_x = torch.nn.functional.avg_pool2d(x_f32, window_size, stride=1, padding=pad)
+    mu_y = torch.nn.functional.avg_pool2d(y_f32, window_size, stride=1, padding=pad)
+    mu_x_sq = mu_x.pow(2)
+    mu_y_sq = mu_y.pow(2)
+    mu_xy = mu_x * mu_y
+    sigma_x_sq = (
+        torch.nn.functional.avg_pool2d(x_f32 * x_f32, window_size, stride=1, padding=pad) - mu_x_sq
+    ).clamp(min=0.0)
+    sigma_y_sq = (
+        torch.nn.functional.avg_pool2d(y_f32 * y_f32, window_size, stride=1, padding=pad) - mu_y_sq
+    ).clamp(min=0.0)
+    sigma_xy = (
+        torch.nn.functional.avg_pool2d(x_f32 * y_f32, window_size, stride=1, padding=pad) - mu_xy
+    )
+    ssim_n = (2.0 * mu_xy + c1) * (2.0 * sigma_xy + c2)
+    ssim_d = (mu_x_sq + mu_y_sq + c1) * (sigma_x_sq + sigma_y_sq + c2)
+    return ((ssim_n / ssim_d) + 1.0).mul(0.5).clamp(0.0, 1.0)
+
+
+def test_separable_ssim_matches_2d_and_bfloat16_finite() -> None:
+    torch.manual_seed(0)
+    x = torch.rand((2, 3, 64, 64), dtype=torch.float32)
+    y = torch.rand((2, 3, 64, 64), dtype=torch.float32)
+
+    sep = _ssim_map(x, y, window_size=11)
+    ref = _naive_2d_ssim_map(x, y, window_size=11)
+    assert sep.shape == ref.shape
+    assert torch.allclose(sep, ref, atol=1e-5, rtol=1e-5)
+
+    # Constant inputs + bfloat16 precision should produce strictly finite bounded outputs
+    ones_bf16 = torch.ones((1, 3, 32, 32), dtype=torch.bfloat16)
+    zeros_bf16 = torch.zeros((1, 3, 32, 32), dtype=torch.bfloat16)
+    bf_same = _ssim_map(ones_bf16, ones_bf16)
+    bf_rand = _ssim_map(x.to(torch.bfloat16), y.to(torch.bfloat16))
+    bf_extreme = _ssim_map(ones_bf16, zeros_bf16)
+    for out in (bf_same, bf_rand, bf_extreme):
+        assert out.dtype == torch.float32
+        assert torch.isfinite(out).all()
+        assert float(out.min().item()) >= 0.0
+        assert float(out.max().item()) <= 1.0
+
+
+def test_ms_l1_ssim_denoising_training_and_calibration() -> None:
+    # Verify batch corruption behavior
+    clean = torch.rand((4, 3, 64, 64), dtype=torch.float32)
+    assert torch.equal(_corrupt_batch(clean, denoise_prob=0.0, seed=1), clean)
+    corrupted_a = _corrupt_batch(clean, denoise_prob=1.0, seed=42)
+    corrupted_b = _corrupt_batch(clean, denoise_prob=1.0, seed=42)
+    assert torch.equal(corrupted_a, corrupted_b)
+    assert not torch.equal(corrupted_a, clean)
+    assert float(corrupted_a.min().item()) >= float(clean.min().item()) - 1e-6
+    assert float(corrupted_a.max().item()) <= float(clean.max().item()) + 1e-6
+
+    # Verify multi-scale loss decreases with better reconstruction
+    assert float(_ms_l1_ssim_loss(clean, clean).item()) < float(
+        _ms_l1_ssim_loss(corrupted_a, clean).item()
+    )
+
+    rng = np.random.default_rng(9)
+    # Create textured background so texture damping can also be verified
+    grid_y, grid_x = np.meshgrid(np.arange(64), np.arange(64), indexing="ij")
+    checker = (((grid_y // 2 + grid_x // 2) % 2) * 80 + 70).astype(np.int16)
+    base_rgb = np.stack([checker, checker, checker], axis=-1)
+    train_u8 = np.clip(
+        base_rgb[None, ...] + rng.integers(-4, 5, size=(4, 64, 64, 3), dtype=np.int16),
+        0,
+        255,
+    ).astype(np.uint8)
+
+    device = torch.device("cpu")
+    extractor = RawPixelExtractor(
+        DatasetConfig(image_size=(64, 64)),
+        RawExtractorConfig(),
+        device=device,
+    )
+    cfg = AutoencoderConfig(
+        latent_dim=16,
+        base_channels=16,
+        num_stages=3,
+        loss_type="ms_l1_ssim",
+        epochs=6,
+        lr=5e-3,
+        score_top_k_pct=0.02,
+        gaussian_sigma=1.0,
+        spatial_dropout=0.1,
+        denoise_prob=0.5,
+        texture_damping=2.0,
+    )
+    model = RawAutoencoderModel(
+        in_channels=3,
+        config=cfg,
+        device=device,
+        batch_size=2,
+        seed=42,
+    )
+    losses = model.fit(train_u8, extractor)
+    assert len(losses) == 6
+    assert losses[-1] < losses[0]
+    assert bool(model.net.calibrated.item()) is True
+    assert torch.isfinite(model.net.err_mean).all()
+    assert float(model.net.err_std.item()) >= 1e-4
+    assert model.net.normal_mu_map.shape == (1, 1, 16, 16)
+    assert model.net.normal_std_map.shape == (1, 1, 16, 16)
+
+    normal_test = train_u8[:1].copy()
+    defect_test = train_u8[:1].copy()
+    defect_test[0, 20:40, 20:40, :] = 250
+    both = np.concatenate([normal_test, defect_test], axis=0)
+    scores, amaps, recons = model.predict_batch(both, extractor, target_hw=(64, 64))
+    assert scores.shape == (2,)
+    assert amaps.shape == (2, 64, 64)
+    assert recons.shape == (2, 64, 64, 3)
+    assert np.isfinite(scores).all() and np.isfinite(amaps).all()
+    assert float(amaps.min()) >= 0.0
+    assert scores[1] > scores[0]
+
+    # Check texture damping reduces raw error over textured reconstructions when uncalibrated
+    with torch.inference_mode():
+        model.net.eval()
+        x_t = extractor.extract_batch(normal_test)
+        _, raw_damped = model._score_batch_tensor(x_t, target_hw=(64, 64), apply_calibration=False)
+        model.config = AutoencoderConfig(
+            latent_dim=16,
+            base_channels=16,
+            num_stages=3,
+            loss_type="ms_l1_ssim",
+            epochs=6,
+            lr=5e-3,
+            score_top_k_pct=0.02,
+            gaussian_sigma=1.0,
+            spatial_dropout=0.1,
+            denoise_prob=0.5,
+            texture_damping=0.0,
+        )
+        _, raw_undamped = model._score_batch_tensor(
+            x_t, target_hw=(64, 64), apply_calibration=False
+        )
+        assert float(raw_damped.mean().item()) < float(raw_undamped.mean().item())
+
+
+def test_save_load_preserves_weights_metadata_and_buffers(tmp_path: Path) -> None:
+    rng = np.random.default_rng(5)
+    train_u8 = rng.integers(80, 140, size=(2, 32, 32, 3), dtype=np.uint8)
+    device = torch.device("cpu")
+    extractor = RawPixelExtractor(
+        DatasetConfig(image_size=(32, 32)),
+        RawExtractorConfig(),
+        device=device,
+    )
+    cfg = AutoencoderConfig(
+        latent_dim=16,
+        base_channels=8,
+        num_stages=3,
+        loss_type="ms_l1_ssim",
+        epochs=2,
+        spatial_dropout=0.25,
+        denoise_prob=0.5,
+        texture_damping=2.0,
+    )
+    model = RawAutoencoderModel(in_channels=3, config=cfg, device=device, batch_size=2, seed=7)
+    model.fit(train_u8, extractor)
+    scores_before, maps_before, recons_before = model.predict_batch(
+        train_u8, extractor, target_hw=(32, 32)
+    )
+
+    ckpt_path = tmp_path / "weights" / "model.pt"
+    model.save(ckpt_path)
+    raw_ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    assert raw_ckpt["meta"]["spatial_dropout"] == pytest.approx(0.25)
+    assert raw_ckpt["meta"]["latent_dim"] == 16
+    assert raw_ckpt["meta"]["num_stages"] == 3
+
+    reloaded = RawAutoencoderModel(in_channels=3, config=cfg, device=device, batch_size=2, seed=7)
+    reloaded.load(ckpt_path)
+
+    for (k_a, v_a), (k_b, v_b) in zip(
+        model.net.state_dict().items(), reloaded.net.state_dict().items(), strict=True
+    ):
+        assert k_a == k_b
+        assert torch.equal(v_a, v_b)
+
+    scores_after, maps_after, recons_after = reloaded.predict_batch(
+        train_u8, extractor, target_hw=(32, 32)
+    )
+    assert np.allclose(scores_before, scores_after, atol=1e-6)
+    assert np.allclose(maps_before, maps_after, atol=1e-6)
+    assert np.array_equal(recons_before, recons_after)
+
+
+def test_cli_new_flags_and_config_validation(tmp_path: Path) -> None:
+    data_root = _create_synthetic_mvtec(tmp_path)
+    args = build_parser().parse_args(
+        [
+            "--data-dir",
+            str(data_root),
+            "--loss",
+            "ms_l1_ssim",
+            "--spatial-dropout",
+            "0.2",
+            "--denoise-prob",
+            "0.75",
+            "--texture-damping",
+            "1.5",
+            "--device",
+            "cpu",
+        ]
+    )
+    cfg = PipelineConfig.from_args(**vars(args))
+    cfg.validate()
+    assert cfg.autoencoder.loss_type == "ms_l1_ssim"
+    assert cfg.autoencoder.spatial_dropout == pytest.approx(0.2)
+    assert cfg.autoencoder.denoise_prob == pytest.approx(0.75)
+    assert cfg.autoencoder.texture_damping == pytest.approx(1.5)
+
+    for bad_ae in (
+        AutoencoderConfig(spatial_dropout=1.0),
+        AutoencoderConfig(denoise_prob=1.5),
+        AutoencoderConfig(texture_damping=-0.1),
+    ):
+        bad_cfg = PipelineConfig(
+            dataset=DatasetConfig(root_dir=data_root),
+            autoencoder=bad_ae,
+            device="cpu",
+        )
+        with pytest.raises(ValueError):
+            bad_cfg.validate()

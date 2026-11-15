@@ -118,6 +118,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Gaussian blur sigma for anomaly map smoothing",
     )
     parser.add_argument(
+        "--spatial-dropout",
+        type=float,
+        default=0.1,
+        help="Dropout2d probability in the encoder spatial context bottleneck",
+    )
+    parser.add_argument(
+        "--denoise-prob",
+        type=float,
+        default=0.5,
+        help="Per-image probability of CutPaste/streak/noise denoising corruption during fit()",
+    )
+    parser.add_argument(
+        "--texture-damping",
+        type=float,
+        default=2.0,
+        help="Weight alpha damping high-variance textures using sqrt(Var(x_hat))",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="results",

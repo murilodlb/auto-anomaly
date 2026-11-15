@@ -186,6 +186,13 @@ def _run_single_category(
         f"train={len(train_split.images)}, test={len(test_split.images)}, "
         f"image_size={config.dataset.image_size}, device={device}"
     )
+    ae_cfg = config.autoencoder
+    print(
+        f"Autoencoder config: loss={ae_cfg.loss_type}, stages={ae_cfg.num_stages}, "
+        f"base_ch={ae_cfg.base_channels}, latent={ae_cfg.latent_dim}, "
+        f"dropout={ae_cfg.spatial_dropout:g}, denoise={ae_cfg.denoise_prob:g}, "
+        f"texture_damping={ae_cfg.texture_damping:g}"
+    )
 
     extractor = get_extractor(config, device)
     model = get_model(
@@ -208,6 +215,21 @@ def _run_single_category(
             weights_path = config.output.weights_dir / "model.pt"
             model.save(weights_path)
             print(f"Saved model weights to {weights_path}")
+
+    calibration_info: dict[str, Any] = {"calibrated": False}
+    if hasattr(model, "net") and hasattr(model.net, "calibrated"):
+        is_cal = bool(model.net.calibrated.item())
+        calibration_info = {
+            "calibrated": is_cal,
+            "err_mean": float(model.net.err_mean.item()),
+            "err_std": float(model.net.err_std.item()),
+            "texture_damping": config.autoencoder.texture_damping,
+        }
+        if config.autoencoder.load_weights is not None and is_cal:
+            print(
+                f"Loaded calibration baseline: err_mean={calibration_info['err_mean']:.6f}, "
+                f"err_std={calibration_info['err_std']:.6f}"
+            )
 
     t_infer = time.perf_counter()
     score_batches: list[np.ndarray] = []
@@ -264,6 +286,7 @@ def _run_single_category(
         "train_time_s": train_time_s,
         "infer_time_s": infer_time_s,
         "infer_fps": len(test_split.images) / infer_time_s if infer_time_s > 0 else 0.0,
+        "calibration": calibration_info,
         "epoch_losses": epoch_losses,
         "metrics": metrics,
     }

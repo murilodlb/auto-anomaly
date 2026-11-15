@@ -8,7 +8,7 @@ from typing import Any
 
 import cv2
 
-VALID_LOSS_TYPES = frozenset({"l1", "l2", "smooth_l1", "l1_ssim"})
+VALID_LOSS_TYPES = frozenset({"l1", "l2", "smooth_l1", "l1_ssim", "ms_l1_ssim"})
 VALID_EXTRACTORS = frozenset({"raw"})
 VALID_MODELS = frozenset({"autoencoder"})
 MVTEC_CATEGORIES: tuple[str, ...] = (
@@ -127,6 +127,9 @@ class AutoencoderConfig:
     weight_decay: float = 1e-5
     score_top_k_pct: float = 0.01
     gaussian_sigma: float = 4.0
+    spatial_dropout: float = 0.1
+    denoise_prob: float = 0.5
+    texture_damping: float = 2.0
     use_amp: bool = True
     save_weights: bool = True
     load_weights: Path | None = None
@@ -253,6 +256,12 @@ class PipelineConfig:
             raise ValueError(f"score_top_k_pct must be in (0.0, 1.0], got {ae.score_top_k_pct}")
         if ae.gaussian_sigma < 0.0:
             raise ValueError(f"gaussian_sigma must be >= 0, got {ae.gaussian_sigma}")
+        if not (0.0 <= ae.spatial_dropout < 1.0):
+            raise ValueError(f"spatial_dropout must be in [0.0, 1.0), got {ae.spatial_dropout}")
+        if not (0.0 <= ae.denoise_prob <= 1.0):
+            raise ValueError(f"denoise_prob must be in [0.0, 1.0], got {ae.denoise_prob}")
+        if ae.texture_damping < 0.0:
+            raise ValueError(f"texture_damping must be >= 0, got {ae.texture_damping}")
         if ae.load_weights is not None and not ae.load_weights.is_file():
             raise FileNotFoundError(f"Checkpoint file does not exist: {ae.load_weights}")
 
@@ -312,6 +321,9 @@ class PipelineConfig:
             weight_decay=float(kwargs.get("weight_decay", 1e-5)),
             score_top_k_pct=float(kwargs.get("top_k_pct", 0.01)),
             gaussian_sigma=float(kwargs.get("gaussian_sigma", 4.0)),
+            spatial_dropout=float(kwargs.get("spatial_dropout", 0.1)),
+            denoise_prob=float(kwargs.get("denoise_prob", 0.5)),
+            texture_damping=float(kwargs.get("texture_damping", 2.0)),
             use_amp=not bool(kwargs.get("no_amp", False)),
             save_weights=not bool(kwargs.get("no_save_weights", False)),
             load_weights=load_weights,
