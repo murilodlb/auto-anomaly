@@ -125,7 +125,7 @@ class AutoencoderConfig:
     epochs: int = 50
     lr: float = 1e-3
     weight_decay: float = 1e-5
-    score_top_k_pct: float = 0.01
+    score_top_k_pct: float = 0.0005
     gaussian_sigma: float = 4.0
     spatial_dropout: float = 0.1
     denoise_prob: float = 0.5
@@ -242,6 +242,11 @@ class PipelineConfig:
             raise ValueError(
                 f"image_size {(h, w)} must be divisible by 2**num_stages ({stride_factor})"
             )
+        if (h // stride_factor) * (w // stride_factor) < 2:
+            raise ValueError(
+                f"image_size {(h, w)} with num_stages={ae.num_stages} yields a 1x1 bottleneck; "
+                "InstanceNorm2d requires bottleneck spatial area >= 2"
+            )
         if ae.loss_type not in VALID_LOSS_TYPES:
             raise ValueError(
                 f"Unsupported loss_type {ae.loss_type!r}; expected one of {VALID_LOSS_TYPES}"
@@ -319,7 +324,7 @@ class PipelineConfig:
             epochs=int(kwargs.get("epochs", 50)),
             lr=float(kwargs.get("lr", 1e-3)),
             weight_decay=float(kwargs.get("weight_decay", 1e-5)),
-            score_top_k_pct=float(kwargs.get("top_k_pct", 0.01)),
+            score_top_k_pct=float(kwargs.get("top_k_pct", 0.0005)),
             gaussian_sigma=float(kwargs.get("gaussian_sigma", 4.0)),
             spatial_dropout=float(kwargs.get("spatial_dropout", 0.1)),
             denoise_prob=float(kwargs.get("denoise_prob", 0.5)),

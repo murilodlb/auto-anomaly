@@ -32,10 +32,15 @@ from src.metrics import (
 from src.models.autoencoder import (
     ConvAutoencoder,
     RawAutoencoderModel,
+    _compute_raw_error_map,
     _corrupt_batch,
+    _gms_map,
+    _iter_msgms_error_scales,
     _ms_l1_ssim_loss,
     _ssim_map,
 )
+from src.results import inspect_results_folders, scan_results
+from src.results import main as results_main
 from src.run import run_pipeline
 
 
@@ -93,6 +98,14 @@ def test_config_validation_and_from_args(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="divisible"):
         bad_size_cfg.validate()
+
+    bottleneck_1x1_cfg = PipelineConfig(
+        dataset=DatasetConfig(root_dir=data_root, image_size=(64, 64)),
+        autoencoder=AutoencoderConfig(num_stages=6),
+        device="cpu",
+    )
+    with pytest.raises(ValueError, match="1x1 bottleneck"):
+        bottleneck_1x1_cfg.validate()
 
 
 def test_dataset_loader_and_missing_mask(tmp_path: Path) -> None:
@@ -273,6 +286,9 @@ def test_end_to_end_pipeline_and_weight_reload(tmp_path: Path) -> None:
     assert "au_pro" in saved["metrics"]
     assert "classification_au_roc_max" in saved["metrics"]
     assert "au_pro" in saved["metrics"]["per_defect"]["hole"]
+    assert saved["hyperparams"]["loss_type"] == "l2"
+    assert (out_base / "all_experiments_metrics.csv").is_file()
+    assert (out_base / "all_per_defect_metrics.csv").is_file()
 
     with (exp_dir / "per_sample_scores.csv").open(encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
@@ -359,7 +375,7 @@ def _naive_2d_ssim_map(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) 
     )
     ssim_n = (2.0 * mu_xy + c1) * (2.0 * sigma_xy + c2)
     ssim_d = (mu_x_sq + mu_y_sq + c1) * (sigma_x_sq + sigma_y_sq + c2)
-    return ((ssim_n / ssim_d) + 1.0).mul(0.5).clamp(0.0, 1.0)
+    return (ssim_n / ssim_d).clamp(0.0, 1.0)
 
 
 def test_separable_ssim_matches_2d_and_bfloat16_finite() -> None:
@@ -383,6 +399,75 @@ def test_separable_ssim_matches_2d_and_bfloat16_finite() -> None:
         assert torch.isfinite(out).all()
         assert float(out.min().item()) >= 0.0
         assert float(out.max().item()) <= 1.0
+    # Full [0, 1] dynamic range: ones vs zeros in interior should be near 0.0 (not 0.5)
+    assert float(bf_extreme[:, :, 11:-11, 11:-11].mean().item()) < 0.01
+
+
+def test_gms_map_finite_and_sensitive_to_thin_lines() -> None:
+    torch.manual_seed(1)
+    x = torch.rand((2, 3, 64, 64), dtype=torch.float32)
+    y = torch.rand((2, 3, 64, 64), dtype=torch.float32)
+
+    # Identical inputs -> similarity == 1.0 everywhere (including borders), error == 0.0
+    same_f32 = _gms_map(x, x)
+    assert same_f32.dtype == torch.float32
+    assert same_f32.shape == x.shape
+    assert torch.allclose(same_f32, torch.ones_like(same_f32), atol=1e-6)
+
+    # bfloat16 constant, random, and extreme inputs must remain finite and in [0, 1]
+    ones_bf16 = torch.ones((1, 3, 32, 32), dtype=torch.bfloat16)
+    zeros_bf16 = torch.zeros((1, 3, 32, 32), dtype=torch.bfloat16)
+    for out in (
+        _gms_map(ones_bf16, ones_bf16),
+        _gms_map(x.to(torch.bfloat16), y.to(torch.bfloat16)),
+        _gms_map(ones_bf16, zeros_bf16),
+    ):
+        assert out.dtype == torch.float32
+        assert torch.isfinite(out).all()
+        assert float(out.min().item()) >= 0.0
+        assert float(out.max().item()) <= 1.0
+
+    # Small spatial edge case (1x1 and 2x2) does not crash on reflect padding
+    tiny = torch.rand((1, 3, 1, 1), dtype=torch.float32)
+    tiny_out = _gms_map(tiny, tiny)
+    assert torch.isfinite(tiny_out).all()
+
+    # Thin high-gradient line simulating metal_contamination / thread on uniform grey background
+    recon = torch.full((1, 3, 64, 64), 0.5, dtype=torch.float32)
+    orig = recon.clone()
+    orig[:, :, 31:33, 20:44] = 0.95  # 2-pixel-thick bright staple/line
+    gms_err = 1.0 - _gms_map(recon, orig)
+    line_peak = float(gms_err[:, :, 28:36, 20:44].max().item())
+    bg_mean = float(gms_err[:, :, :15, :15].mean().item())
+    assert line_peak > 0.3
+    assert bg_mean == pytest.approx(0.0, abs=1e-6)
+
+    # Multi-scale MSGMS weights and shapes
+    scales = _iter_msgms_error_scales(recon, orig)
+    assert [w for w, _ in scales] == pytest.approx([0.15, 0.45, 0.40])
+    assert [tuple(m.shape[-2:]) for _, m in scales] == [(64, 64), (32, 32), (16, 16)]
+    assert all(torch.isfinite(m).all() for _, m in scales)
+
+    # Raw error map under ms_l1_ssim on odd/tiny shapes and bfloat16
+    for hw in ((65, 65), (1, 1)):
+        xh_t = torch.rand((2, 3, *hw), dtype=torch.bfloat16)
+        x_t = torch.rand((2, 3, *hw), dtype=torch.bfloat16)
+        raw_em = _compute_raw_error_map(xh_t, x_t, "ms_l1_ssim")
+        assert raw_em.dtype == torch.float32
+        assert raw_em.shape == (2, 1, *hw)
+        assert torch.isfinite(raw_em).all()
+
+    # ConvAutoencoder with InstanceNorm2d under channels_last + bfloat16 autocast
+    net = ConvAutoencoder(in_channels=3, base_channels=8, latent_dim=16, num_stages=3).to(
+        memory_format=torch.channels_last
+    )
+    x_cl = torch.rand((2, 3, 32, 32), dtype=torch.float32).to(memory_format=torch.channels_last)
+    with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+        y_cl = net(x_cl)
+        loss_cl = _ms_l1_ssim_loss(y_cl, x_cl)
+    loss_cl.backward()
+    assert torch.isfinite(loss_cl)
+    assert all(torch.isfinite(p.grad).all() for p in net.parameters() if p.grad is not None)
 
 
 def test_ms_l1_ssim_denoising_training_and_calibration() -> None:
@@ -444,8 +529,17 @@ def test_ms_l1_ssim_denoising_training_and_calibration() -> None:
     assert bool(model.net.calibrated.item()) is True
     assert torch.isfinite(model.net.err_mean).all()
     assert float(model.net.err_std.item()) >= 1e-4
+    assert float(model.net.err_p99.item()) >= float(model.net.err_mean.item())
     assert model.net.normal_mu_map.shape == (1, 1, 16, 16)
     assert model.net.normal_std_map.shape == (1, 1, 16, 16)
+    assert any(isinstance(m, torch.nn.InstanceNorm2d) for m in model.net.encoder)
+
+    # Multi-seed corruption covers all modes (including smooth Gaussian blob stain) within bounds
+    for s in range(10):
+        c_out = _corrupt_batch(clean, denoise_prob=1.0, seed=s)
+        assert torch.isfinite(c_out).all()
+        assert float(c_out.min().item()) >= float(clean.min().item()) - 1e-6
+        assert float(c_out.max().item()) <= float(clean.max().item()) + 1e-6
 
     normal_test = train_u8[:1].copy()
     defect_test = train_u8[:1].copy()
@@ -456,8 +550,15 @@ def test_ms_l1_ssim_denoising_training_and_calibration() -> None:
     assert amaps.shape == (2, 64, 64)
     assert recons.shape == (2, 64, 64, 3)
     assert np.isfinite(scores).all() and np.isfinite(amaps).all()
-    assert float(amaps.min()) >= 0.0
+    assert float(amaps.min()) > 0.0  # smooth softplus avoids flat zero ties
     assert scores[1] > scores[0]
+    flat_amaps = np.sort(amaps.reshape(2, -1), axis=1)[:, ::-1]
+    k_expected = max(1, int(np.ceil(flat_amaps.shape[1] * cfg.score_top_k_pct)))
+    k10_expected = max(1, k_expected // 10)
+    expected_scores = 0.5 * flat_amaps[:, :k_expected].mean(axis=1) + 0.5 * flat_amaps[
+        :, :k10_expected
+    ].mean(axis=1)
+    assert np.allclose(scores, expected_scores, atol=1e-5)
 
     # Check texture damping reduces raw error over textured reconstructions when uncalibrated
     with torch.inference_mode():
@@ -553,6 +654,8 @@ def test_cli_new_flags_and_config_validation(tmp_path: Path) -> None:
     cfg = PipelineConfig.from_args(**vars(args))
     cfg.validate()
     assert cfg.autoencoder.loss_type == "ms_l1_ssim"
+    assert cfg.autoencoder.score_top_k_pct == pytest.approx(0.0005)
+    assert AutoencoderConfig().score_top_k_pct == pytest.approx(0.0005)
     assert cfg.autoencoder.spatial_dropout == pytest.approx(0.2)
     assert cfg.autoencoder.denoise_prob == pytest.approx(0.75)
     assert cfg.autoencoder.texture_damping == pytest.approx(1.5)
@@ -569,3 +672,175 @@ def test_cli_new_flags_and_config_validation(tmp_path: Path) -> None:
         )
         with pytest.raises(ValueError):
             bad_cfg.validate()
+
+
+def test_results_scan_mixed_layout_and_csv_export(tmp_path: Path) -> None:
+    res_dir = tmp_path / "results"
+
+    # 1) Recorded new-format single-category run with per_sample_scores.csv
+    rec_dir = res_dir / "carpet_fullres_ms_l1_ssim_s6_c64_z128"
+    (rec_dir / "heatmaps").mkdir(parents=True)
+    (rec_dir / "heatmaps" / "000.png").write_bytes(b"png")
+    (rec_dir / "metrics.json").write_text(
+        json.dumps(
+            {
+                "experiment_name": "carpet_fullres_ms_l1_ssim_s6_c64_z128",
+                "category": "carpet",
+                "device": "cuda",
+                "image_size": [1024, 1024],
+                "num_train": 76,
+                "num_test": 4,
+                "train_time_s": 60.0,
+                "infer_fps": 30.0,
+                "hyperparams": {
+                    "loss_type": "ms_l1_ssim",
+                    "num_stages": 6,
+                    "base_channels": 64,
+                    "latent_dim": 128,
+                    "epochs": 120,
+                    "batch_size": 16,
+                    "lr": 1e-3,
+                    "weight_decay": 1e-5,
+                    "gaussian_sigma": 10.0,
+                    "score_top_k_pct": 0.002,
+                    "spatial_dropout": 0.1,
+                    "denoise_prob": 0.5,
+                    "texture_damping": 2.0,
+                    "full_res": True,
+                    "use_amp": True,
+                    "pro_integration_limit": 0.3,
+                    "seed": 42,
+                },
+                "calibration": {"calibrated": True, "err_mean": 0.18, "err_std": 0.03},
+                "epoch_losses": [0.4, 0.25],
+                "metrics": {
+                    "au_pro": 0.75,
+                    "pro_integration_limit": 0.3,
+                    "classification_au_roc_max": 0.72,
+                    "image_auroc": 0.70,
+                    "image_ap": 0.85,
+                    "f1_max": 0.90,
+                    "optimal_threshold": 3.0,
+                    "accuracy_at_opt_th": 0.88,
+                    "pixel_auroc": 0.91,
+                    "pixel_ap": 0.25,
+                    "pixel_f1_max": 0.33,
+                    "per_defect": {
+                        "hole": {
+                            "count": 2,
+                            "recall_at_opt_th": 1.0,
+                            "image_auroc": 0.8,
+                            "au_pro": 0.78,
+                            "mean_score": 5.5,
+                            "std_score": 0.4,
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (rec_dir / "per_sample_scores.csv").write_text(
+        "index,image_path,defect_type,label,image_score,predicted_label\n"
+        "0,a.png,good,0,1.0,0\n"
+        "1,b.png,good,0,2.0,0\n"
+        "2,c.png,hole,1,5.0,1\n"
+        "3,d.png,hole,1,6.0,1\n",
+        encoding="utf-8",
+    )
+
+    # 2) Legacy run without "hyperparams" block
+    leg_dir = res_dir / "hazelnut_fullres_l1_ssim_s5_c48_z128"
+    leg_dir.mkdir(parents=True)
+    (leg_dir / "metrics.json").write_text(
+        json.dumps(
+            {
+                "experiment_name": "hazelnut_fullres_l1_ssim_s5_c48_z128",
+                "category": "hazelnut",
+                "device": "cuda",
+                "image_size": [1024, 1024],
+                "num_train": 391,
+                "num_test": 110,
+                "train_time_s": 300.0,
+                "infer_fps": 15.0,
+                "epoch_losses": [0.3, 0.2, 0.1],
+                "metrics": {
+                    "au_pro": 0.88,
+                    "pro_integration_limit": 0.3,
+                    "classification_au_roc_max": 0.66,
+                    "image_auroc": 0.65,
+                    "image_ap": 0.79,
+                    "f1_max": 0.80,
+                    "optimal_threshold": 0.14,
+                    "accuracy_at_opt_th": 0.70,
+                    "pixel_auroc": 0.95,
+                    "pixel_ap": 0.30,
+                    "pixel_f1_max": 0.31,
+                    "per_defect": {},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # 3) Nested multi-category partial run
+    multi_bottle = res_dir / "mvtec_fullres_l1ssim_s5" / "bottle"
+    multi_bottle.mkdir(parents=True)
+    (multi_bottle / "metrics.json").write_text(
+        json.dumps(
+            {
+                "experiment_name": "bottle",
+                "category": "bottle",
+                "device": "cuda",
+                "image_size": [896, 896],
+                "num_train": 209,
+                "num_test": 83,
+                "train_time_s": 100.0,
+                "infer_fps": 20.0,
+                "epoch_losses": [0.2, 0.1],
+                "metrics": {"au_pro": 0.81, "classification_au_roc_max": 0.79, "per_defect": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # 4) Empty / incomplete folder
+    (res_dir / "carpet_fullres_l1_ssim_s4_c64_z256").mkdir(parents=True)
+
+    inv = inspect_results_folders(res_dir)
+    by_name = {entry.folder_name: entry for entry in inv}
+    assert by_name["carpet_fullres_ms_l1_ssim_s6_c64_z128"].status == "complete"
+    assert by_name["carpet_fullres_ms_l1_ssim_s6_c64_z128"].num_heatmaps == 1
+    assert by_name["mvtec_fullres_l1ssim_s5"].status == "partial_multi"
+    assert by_name["carpet_fullres_l1_ssim_s4_c64_z256"].status == "incomplete"
+
+    _, records, defects = scan_results(res_dir, include_incomplete=False)
+    assert len(records) == 3
+    rec_map = {r.experiment_name: r for r in records}
+    assert rec_map["carpet_fullres_ms_l1_ssim_s6_c64_z128"].hp_source == "recorded"
+    assert rec_map["carpet_fullres_ms_l1_ssim_s6_c64_z128"].good_mean_score == pytest.approx(1.5)
+    assert rec_map["carpet_fullres_ms_l1_ssim_s6_c64_z128"].defect_mean_score == pytest.approx(5.5)
+
+    leg = rec_map["hazelnut_fullres_l1_ssim_s5_c48_z128"]
+    assert leg.hp_source == "inferred"
+    assert leg.loss_type == "l1_ssim"
+    assert (leg.num_stages, leg.base_channels, leg.latent_dim, leg.epochs) == (5, 48, 128, 3)
+
+    multi = rec_map["mvtec_fullres_l1ssim_s5/bottle"]
+    assert multi.parent_experiment == "mvtec_fullres_l1ssim_s5"
+    assert multi.loss_type == "l1_ssim"
+    assert multi.num_stages == 5
+    assert len(defects) == 1
+
+    # CLI execution writes both CSVs
+    results_main(["--results-dir", str(res_dir), "--include-incomplete"])
+    exp_csv = res_dir / "all_experiments_metrics.csv"
+    def_csv = res_dir / "all_per_defect_metrics.csv"
+    assert exp_csv.is_file() and def_csv.is_file()
+    with exp_csv.open(encoding="utf-8") as f:
+        csv_rows = list(csv.DictReader(f))
+    assert len(csv_rows) == 4
+    with def_csv.open(encoding="utf-8") as f:
+        def_rows = list(csv.DictReader(f))
+    assert len(def_rows) == 1
+    assert def_rows[0]["defect_type"] == "hole"

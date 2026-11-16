@@ -45,14 +45,57 @@ def _ssim_map(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.
 
     ssim_n = (2.0 * mu_xy + c1) * (2.0 * sigma_xy + c2)
     ssim_d = (mu_x_sq + mu_y_sq + c1) * (sigma_x_sq + sigma_y_sq + c2)
-    return ((ssim_n / ssim_d) + 1.0).mul(0.5).clamp(0.0, 1.0)
+    return (ssim_n / ssim_d).clamp(0.0, 1.0)
 
 
-def _iter_ssim_error_scales(x_hat: torch.Tensor, x: torch.Tensor) -> list[torch.Tensor]:
-    """Return per-pixel (B, 1, H_s, W_s) (1 - SSIM) maps at 1.0x, 0.5x, and 0.25x scales."""
+def _gms_map(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    c: float = 0.0026,
+    window_size: int = 11,
+) -> torch.Tensor:
+    """Compute smoothed per-pixel (B, C, H, W) Gradient Magnitude Similarity (GMS) in [0, 1]."""
+    x_f32 = x.float()
+    y_f32 = y.float()
+    c_ch = x_f32.shape[1]
+
+    sobel_x_base = (
+        torch.tensor(
+            [[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]],
+            dtype=torch.float32,
+            device=x_f32.device,
+        )
+        / 4.0
+    )
+    sobel_y_base = sobel_x_base.t().contiguous()
+    kx = sobel_x_base.view(1, 1, 3, 3).expand(c_ch, 1, 3, 3).contiguous()
+    ky = sobel_y_base.view(1, 1, 3, 3).expand(c_ch, 1, 3, 3).contiguous()
+
+    pad_mode = "reflect" if min(x_f32.shape[-2], x_f32.shape[-1]) > 1 else "replicate"
+    x_pad = torch.nn.functional.pad(x_f32, (1, 1, 1, 1), mode=pad_mode)
+    y_pad = torch.nn.functional.pad(y_f32, (1, 1, 1, 1), mode=pad_mode)
+
+    gx_x = torch.nn.functional.conv2d(x_pad, kx, groups=c_ch)
+    gy_x = torch.nn.functional.conv2d(x_pad, ky, groups=c_ch)
+    gx_y = torch.nn.functional.conv2d(y_pad, kx, groups=c_ch)
+    gy_y = torch.nn.functional.conv2d(y_pad, ky, groups=c_ch)
+
+    grad_x = torch.sqrt(gx_x * gx_x + gy_x * gy_x + 1e-12)
+    grad_y = torch.sqrt(gx_y * gx_y + gy_y * gy_y + 1e-12)
+
+    gms = (2.0 * grad_x * grad_y + c) / (grad_x * grad_x + grad_y * grad_y + c)
+    gms_err = _separable_avg_pool2d((1.0 - gms).clamp(0.0, 1.0), window_size=window_size)
+    return (1.0 - gms_err).clamp(0.0, 1.0)
+
+
+def _iter_msgms_error_scales(
+    x_hat: torch.Tensor,
+    x: torch.Tensor,
+) -> list[tuple[float, torch.Tensor]]:
+    """Return weighted (weight, error_map) pairs combining SSIM and GMS at 1x, 0.5x, 0.25x."""
     h, w = x.shape[-2], x.shape[-1]
-    maps: list[torch.Tensor] = []
-    for scale in (1, 2, 4):
+    maps: list[tuple[float, torch.Tensor]] = []
+    for scale, weight in ((1, 0.15), (2, 0.45), (4, 0.40)):
         if min(h, w) < scale:
             continue
         if scale == 1:
@@ -60,8 +103,16 @@ def _iter_ssim_error_scales(x_hat: torch.Tensor, x: torch.Tensor) -> list[torch.
         else:
             xh_s = torch.nn.functional.avg_pool2d(x_hat.float(), kernel_size=scale)
             x_s = torch.nn.functional.avg_pool2d(x.float(), kernel_size=scale)
-        maps.append((1.0 - _ssim_map(xh_s, x_s)).mean(dim=1, keepdim=True))
+        ssim_err = (1.0 - _ssim_map(xh_s, x_s)).mean(dim=1, keepdim=True)
+        gms_err = (1.0 - _gms_map(xh_s, x_s)).mean(dim=1, keepdim=True)
+        scale_err = 0.5 * ssim_err + 0.5 * gms_err
+        maps.append((weight, scale_err))
     return maps
+
+
+def _iter_ssim_error_scales(x_hat: torch.Tensor, x: torch.Tensor) -> list[torch.Tensor]:
+    """Return unweighted multi-scale SSIM+GMS error maps at 1.0x, 0.5x, and 0.25x scales."""
+    return [err_map for _, err_map in _iter_msgms_error_scales(x_hat, x)]
 
 
 def _l1_ssim_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -72,11 +123,12 @@ def _l1_ssim_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
 
 
 def _ms_l1_ssim_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """Multi-scale L1 + SSIM loss across 1.0x, 0.5x, and 0.25x spatial resolutions."""
+    """Multi-scale L1 + SSIM + GMS loss across 1.0x, 0.5x, and 0.25x spatial resolutions."""
     l1 = torch.nn.functional.l1_loss(x_hat.float(), x.float())
-    scale_errs = [s.mean() for s in _iter_ssim_error_scales(x_hat, x)]
-    ssim_err = torch.stack(scale_errs).mean()
-    return 0.2 * l1 + 0.8 * ssim_err
+    weighted_scales = _iter_msgms_error_scales(x_hat, x)
+    total_weight = sum(w for w, _ in weighted_scales)
+    struct_err = torch.stack([w * s.mean() for w, s in weighted_scales]).sum() / total_weight
+    return 0.2 * l1 + 0.8 * struct_err
 
 
 _LOSS_FUNCTIONS = {
@@ -105,15 +157,20 @@ def _compute_raw_error_map(x_hat: torch.Tensor, x: torch.Tensor, loss_type: str)
     if loss_type == "ms_l1_ssim":
         l1_map = (x_f32 - x_hat_f32).abs().mean(dim=1, keepdim=True)
         target_hw = (x_f32.shape[-2], x_f32.shape[-1])
+        weighted_scales = _iter_msgms_error_scales(x_hat_f32, x_f32)
+        total_weight = sum(w for w, _ in weighted_scales)
         upsampled_scales = [
-            s
-            if s.shape[-2:] == target_hw
-            else torch.nn.functional.interpolate(
-                s, size=target_hw, mode="bilinear", align_corners=False
+            w
+            * (
+                s
+                if s.shape[-2:] == target_hw
+                else torch.nn.functional.interpolate(
+                    s, size=target_hw, mode="bilinear", align_corners=False
+                )
             )
-            for s in _iter_ssim_error_scales(x_hat_f32, x_f32)
+            for w, s in weighted_scales
         ]
-        ssim_err_map = torch.stack(upsampled_scales, dim=0).mean(dim=0)
+        ssim_err_map = torch.stack(upsampled_scales, dim=0).sum(dim=0) / total_weight
         return 0.2 * l1_map + 0.8 * ssim_err_map
     return ((x_f32 - x_hat_f32) ** 2).mean(dim=1, keepdim=True)
 
@@ -147,14 +204,14 @@ def _corrupt_batch(
             continue
         num_patches = rng.randint(1, 3)
         for _ in range(num_patches):
-            target_area = rng.uniform(0.01, 0.08) * float(h * w)
+            target_area = rng.uniform(0.01, 0.18) * float(h * w)
             aspect = math.exp(rng.uniform(min_log_ar, max_log_ar))
             ph = min(h, max(2, round(math.sqrt(target_area * aspect))))
             pw = min(w, max(2, round(math.sqrt(target_area / aspect))))
 
             y0 = rng.randint(0, max(0, h - ph))
             x0 = rng.randint(0, max(0, w - pw))
-            mode = rng.randint(0, 2)
+            mode = rng.randint(0, 3)
 
             if mode == 0:
                 streak_mode = rng.randint(0, 2)
@@ -176,12 +233,25 @@ def _corrupt_batch(
                 sy0 = rng.randint(0, max(0, h - ph))
                 sx0 = rng.randint(0, max(0, w - pw))
                 patch = x[src_i, :, sy0 : sy0 + ph, sx0 : sx0 + pw].clone()
-            else:
+            elif mode == 2:
                 sigma = rng.uniform(0.15, 0.45) * val_span_t
                 noise = torch.randn(
                     (c, ph, pw), device=device, dtype=dtype, generator=torch_gen
                 )
                 patch = x_noisy[i, :, y0 : y0 + ph, x0 : x0 + pw] + noise * sigma
+            else:
+                yy = torch.linspace(-1.0, 1.0, steps=ph, device=device, dtype=dtype).view(ph, 1)
+                xx = torch.linspace(-1.0, 1.0, steps=pw, device=device, dtype=dtype).view(1, pw)
+                sigma_y = rng.uniform(0.35, 0.55)
+                sigma_x = rng.uniform(0.35, 0.55)
+                gauss_2d = torch.exp(-0.5 * ((yy / sigma_y) ** 2 + (xx / sigma_x) ** 2))
+                stain_scale = torch.tensor(
+                    [rng.uniform(0.2, 1.8) for _ in range(c)],
+                    device=device,
+                    dtype=dtype,
+                ).view(c, 1, 1)
+                mult = 1.0 + (stain_scale - 1.0) * gauss_2d.unsqueeze(0)
+                patch = x_noisy[i, :, y0 : y0 + ph, x0 : x0 + pw] * mult
 
             x_noisy[i, :, y0 : y0 + ph, x0 : x0 + pw] = patch.clamp(x_min_t, x_max_t)
 
@@ -193,6 +263,7 @@ class ConvAutoencoder(torch.nn.Module):
 
     err_mean: torch.Tensor
     err_std: torch.Tensor
+    err_p99: torch.Tensor
     calibrated: torch.Tensor
     normal_mu_map: torch.Tensor
     normal_std_map: torch.Tensor
@@ -221,6 +292,7 @@ class ConvAutoencoder(torch.nn.Module):
 
         self.register_buffer("err_mean", torch.zeros(1, dtype=torch.float32))
         self.register_buffer("err_std", torch.ones(1, dtype=torch.float32))
+        self.register_buffer("err_p99", torch.zeros(1, dtype=torch.float32))
         self.register_buffer("calibrated", torch.zeros(1, dtype=torch.bool))
         self.register_buffer("normal_mu_map", torch.zeros((1, 1, 16, 16), dtype=torch.float32))
         self.register_buffer("normal_std_map", torch.ones((1, 1, 16, 16), dtype=torch.float32))
@@ -241,11 +313,11 @@ class ConvAutoencoder(torch.nn.Module):
         enc_layers.extend(
             [
                 torch.nn.Conv2d(ch_in, latent_dim, kernel_size=3, padding=1, bias=False),
-                torch.nn.BatchNorm2d(latent_dim),
+                torch.nn.InstanceNorm2d(latent_dim, affine=True),
                 torch.nn.LeakyReLU(0.2, inplace=True),
                 torch.nn.Dropout2d(p=spatial_dropout),
                 torch.nn.Conv2d(latent_dim, latent_dim, kernel_size=3, padding=1, bias=False),
-                torch.nn.BatchNorm2d(latent_dim),
+                torch.nn.InstanceNorm2d(latent_dim, affine=True),
                 torch.nn.LeakyReLU(0.2, inplace=True),
             ]
         )
@@ -430,7 +502,20 @@ class RawAutoencoderModel:
         err_map = _gaussian_blur_2d(err_map, self.config.gaussian_sigma)
 
         if apply_calibration and bool(self.net.calibrated.item()):
-            err_map = (err_map - self.net.err_mean).clamp(min=0.0) / (self.net.err_std + 1e-4)
+            mu_map = 0.5 * self.net.err_mean + 0.5 * torch.nn.functional.interpolate(
+                self.net.normal_mu_map,
+                size=err_map.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            std_map = 0.5 * self.net.err_std + 0.5 * torch.nn.functional.interpolate(
+                self.net.normal_std_map,
+                size=err_map.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            z_map = (err_map - mu_map) / (std_map + 1e-4)
+            err_map = torch.nn.functional.softplus(z_map - 1.5, beta=2.0)
 
         return x_hat_f32, err_map
 
@@ -472,6 +557,7 @@ class RawAutoencoderModel:
         mean_val = sum_err / float(total_pixels)
         var_val = (sum_err_sq / float(total_pixels) - mean_val * mean_val).clamp(min=0.0)
         std_val = torch.sqrt(var_val).clamp(min=1e-4)
+        p99_val = mean_val + 2.5 * std_val
 
         sp_mean = spatial_sum / float(total_images)
         sp_var = (spatial_sum_sq / float(total_images) - sp_mean * sp_mean).clamp(min=0.0)
@@ -479,12 +565,14 @@ class RawAutoencoderModel:
 
         self.net.err_mean.copy_(mean_val.view(1).to(torch.float32))
         self.net.err_std.copy_(std_val.view(1).to(torch.float32))
+        self.net.err_p99.copy_(p99_val.view(1).to(torch.float32))
         self.net.normal_mu_map.copy_(sp_mean.to(torch.float32))
         self.net.normal_std_map.copy_(sp_std.to(torch.float32))
         self.net.calibrated.fill_(True)
         print(
             f"[Calibration] err_mean={float(self.net.err_mean.item()):.6f} "
-            f"err_std={float(self.net.err_std.item()):.6f}",
+            f"err_std={float(self.net.err_std.item()):.6f} "
+            f"err_p99={float(self.net.err_p99.item()):.6f}",
             flush=True,
         )
 
@@ -565,7 +653,10 @@ class RawAutoencoderModel:
             flat = err_map.flatten(start_dim=1)
             k = max(1, math.ceil(flat.shape[1] * self.config.score_top_k_pct))
             top_vals = torch.topk(flat, k=k, dim=1).values
-            image_scores = top_vals.mean(dim=1)
+            image_scores = (
+                0.5 * top_vals.mean(dim=1)
+                + 0.5 * top_vals[:, : max(1, k // 10)].mean(dim=1)
+            )
 
             if hasattr(extractor, "to_uint8_images"):
                 recons_uint8 = extractor.to_uint8_images(x_hat)

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 from src.config import VALID_LOSS_TYPES, PipelineConfig
 from src.extractors import EXTRACTOR_NAMES
 from src.models import MODEL_NAMES
+from src.results import summarize_and_export
 from src.run import run_pipeline
 
 
@@ -63,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--top-k-pct",
         type=float,
-        default=0.01,
+        default=0.0005,
         help="Top percentage of pixels averaged for image-level score",
     )
     parser.add_argument(
@@ -157,12 +159,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Export native-resolution .tiff anomaly maps compatible with official MVTec evaluator",
     )
+    parser.add_argument(
+        "--summarize-results",
+        action="store_true",
+        help="Inspect --output-dir contents, print leaderboard, and export comparison CSVs",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     """Parse CLI arguments and run the anomaly detection pipeline."""
     args = build_parser().parse_args(argv)
+    if args.summarize_results:
+        summarize_and_export(results_dir=Path(args.output_dir))
+        return
     config = PipelineConfig.from_args(**vars(args))
     run_pipeline(config)
 

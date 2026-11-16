@@ -26,6 +26,7 @@ from src.dataset import MVTecSplit, iter_batches, load_mvtec_category
 from src.extractors import get_extractor
 from src.metrics import compute_metrics_with_curves
 from src.models import get_model
+from src.results import export_results_csvs
 from src.visualization import (
     save_diagnostic_samples,
     save_pro_and_roc_plots,
@@ -168,9 +169,39 @@ def _export_tiff_anomaly_maps(
     return count
 
 
+def _serialize_hyperparams(config: PipelineConfig) -> dict[str, Any]:
+    """Flatten training, model, and scoring hyperparameters for metrics.json persistence."""
+    ae = config.autoencoder
+    ds = config.dataset
+    raw = config.extractors.raw
+    return {
+        "loss_type": ae.loss_type,
+        "num_stages": ae.num_stages,
+        "base_channels": ae.base_channels,
+        "latent_dim": ae.latent_dim,
+        "epochs": ae.epochs,
+        "batch_size": ds.batch_size,
+        "lr": ae.lr,
+        "weight_decay": ae.weight_decay,
+        "gaussian_sigma": ae.gaussian_sigma,
+        "score_top_k_pct": ae.score_top_k_pct,
+        "spatial_dropout": ae.spatial_dropout,
+        "denoise_prob": ae.denoise_prob,
+        "texture_damping": ae.texture_damping,
+        "full_res": ds.full_res,
+        "grayscale": ds.grayscale,
+        "use_amp": ae.use_amp,
+        "normalize_mean": list(raw.normalize_mean) if raw.normalize_mean is not None else None,
+        "normalize_std": list(raw.normalize_std) if raw.normalize_std is not None else None,
+        "pro_integration_limit": config.pro_integration_limit,
+        "seed": config.seed,
+    }
+
+
 def _run_single_category(
     config: PipelineConfig,
     tiff_base_dir: Path | None = None,
+    refresh_results_csv: bool = True,
 ) -> dict[str, Any]:
     """Execute training/loading, inference, evaluation, and artifact export for one category."""
     _set_deterministic_seeds(config.seed)
@@ -286,6 +317,7 @@ def _run_single_category(
         "train_time_s": train_time_s,
         "infer_time_s": infer_time_s,
         "infer_fps": len(test_split.images) / infer_time_s if infer_time_s > 0 else 0.0,
+        "hyperparams": _serialize_hyperparams(config),
         "calibration": calibration_info,
         "epoch_losses": epoch_losses,
         "metrics": metrics,
@@ -335,6 +367,10 @@ def _run_single_category(
             pro_integration_limit=config.pro_integration_limit,
             output_dir=output_dir,
         )
+
+    if refresh_results_csv:
+        exp_csv, _ = export_results_csvs(config.output.base_dir)
+        print(f"Updated experiment comparison CSV: {exp_csv}")
 
     return results_payload
 
@@ -409,7 +445,11 @@ def run_multi_category_pipeline(config: PipelineConfig) -> dict[str, Any]:
             dataset=cat_dataset_cfg,
             output=cat_output_cfg,
         )
-        per_category[category] = _run_single_category(cat_cfg, tiff_base_dir=shared_tiff_dir)
+        per_category[category] = _run_single_category(
+            cat_cfg,
+            tiff_base_dir=shared_tiff_dir,
+            refresh_results_csv=False,
+        )
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -439,6 +479,9 @@ def run_multi_category_pipeline(config: PipelineConfig) -> dict[str, Any]:
     summary_path = root_output_dir / "summary_metrics.json"
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(_sanitize_for_json(summary_payload), f, indent=2)
+
+    exp_csv, _ = export_results_csvs(config.output.base_dir)
+    print(f"Updated experiment comparison CSV: {exp_csv}")
 
     return summary_payload
 
