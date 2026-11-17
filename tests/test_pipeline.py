@@ -36,6 +36,7 @@ from src.models.autoencoder import (
     _corrupt_batch,
     _gms_map,
     _iter_msgms_error_scales,
+    _morphological_open_2d,
     _ms_l1_ssim_loss,
     _ssim_map,
 )
@@ -552,11 +553,13 @@ def test_ms_l1_ssim_denoising_training_and_calibration() -> None:
     assert np.isfinite(scores).all() and np.isfinite(amaps).all()
     assert float(amaps.min()) > 0.0  # smooth softplus avoids flat zero ties
     assert scores[1] > scores[0]
-    flat_amaps = np.sort(amaps.reshape(2, -1), axis=1)[:, ::-1]
+    amaps_t = torch.from_numpy(amaps).unsqueeze(1)
+    score_map = torch.nn.functional.avg_pool2d(amaps_t, kernel_size=3, stride=1, padding=1)
+    flat_amaps = np.sort(score_map.squeeze(1).numpy().reshape(2, -1), axis=1)[:, ::-1]
     k_expected = max(1, int(np.ceil(flat_amaps.shape[1] * cfg.score_top_k_pct)))
-    k10_expected = max(1, k_expected // 10)
-    expected_scores = 0.5 * flat_amaps[:, :k_expected].mean(axis=1) + 0.5 * flat_amaps[
-        :, :k10_expected
+    k_core_expected = max(1, int(np.ceil(k_expected * 0.1)))
+    expected_scores = 0.5 * flat_amaps[:, :k_core_expected].mean(axis=1) + 0.5 * flat_amaps[
+        :, :k_expected
     ].mean(axis=1)
     assert np.allclose(scores, expected_scores, atol=1e-5)
 
@@ -844,3 +847,62 @@ def test_results_scan_mixed_layout_and_csv_export(tmp_path: Path) -> None:
         def_rows = list(csv.DictReader(f))
     assert len(def_rows) == 1
     assert def_rows[0]["defect_type"] == "hole"
+
+
+def test_morphological_open_2d_and_block_masking() -> None:
+    # Isolated 1-pixel spike is erased, while contiguous 5x5 defect block is preserved
+    err = torch.zeros((1, 1, 32, 32), dtype=torch.float32)
+    err[0, 0, 6, 6] = 10.0  # isolated single-pixel spike
+    err[0, 0, 18:23, 18:23] = 5.0  # contiguous 5x5 region
+    opened = _morphological_open_2d(err, kernel_size=3)
+    assert float(opened[0, 0, 6, 6].item()) == pytest.approx(0.0, abs=1e-6)
+    assert float(opened[0, 0, 20, 20].item()) == pytest.approx(5.0, abs=1e-6)
+
+    # Structured grid masking + smooth stain modes across a batch remain bounded and finite
+    clean = torch.rand((8, 3, 64, 64), dtype=torch.float32)
+    corrupted = _corrupt_batch(clean, denoise_prob=1.0, seed=123)
+    assert torch.isfinite(corrupted).all()
+    assert not torch.equal(corrupted, clean)
+    assert float(corrupted.min().item()) >= float(clean.min().item()) - 1e-6
+    assert float(corrupted.max().item()) <= float(clean.max().item()) + 1e-6
+
+
+def test_loss_floor_early_stopping_and_cli_flag(tmp_path: Path) -> None:
+    data_root = _create_synthetic_mvtec(tmp_path)
+    args = build_parser().parse_args(
+        ["--data-dir", str(data_root), "--loss-floor", "0.01", "--device", "cpu"]
+    )
+    cfg_cli = PipelineConfig.from_args(**vars(args))
+    cfg_cli.validate()
+    assert cfg_cli.autoencoder.loss_floor == pytest.approx(0.01)
+
+    bad_cfg = PipelineConfig(
+        dataset=DatasetConfig(root_dir=data_root),
+        autoencoder=AutoencoderConfig(loss_floor=-0.01),
+        device="cpu",
+    )
+    with pytest.raises(ValueError, match="loss_floor"):
+        bad_cfg.validate()
+
+    # Train 25 max epochs with high loss_floor so early stopping triggers at epoch 21 (2 hits >= 20)
+    rng = np.random.default_rng(3)
+    train_u8 = rng.integers(100, 150, size=(2, 32, 32, 3), dtype=np.uint8)
+    device = torch.device("cpu")
+    extractor = RawPixelExtractor(
+        DatasetConfig(image_size=(32, 32)),
+        RawExtractorConfig(),
+        device=device,
+    )
+    ae_cfg = AutoencoderConfig(
+        latent_dim=8,
+        base_channels=8,
+        num_stages=3,
+        loss_type="l2",
+        epochs=25,
+        loss_floor=0.5,
+        denoise_prob=0.0,
+    )
+    model = RawAutoencoderModel(in_channels=3, config=ae_cfg, device=device, batch_size=2, seed=42)
+    losses = model.fit(train_u8, extractor)
+    assert len(losses) == 21
+    assert bool(model.net.calibrated.item()) is True

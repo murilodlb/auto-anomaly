@@ -77,6 +77,7 @@ class ExperimentRecord:
     spatial_dropout: float | None
     denoise_prob: float | None
     texture_damping: float | None
+    loss_floor: float | None
     full_res: bool | None
     use_amp: bool | None
     pro_integration_limit: float
@@ -466,6 +467,7 @@ def _build_record_from_run_dir(
         texture_damping=(
             _safe_float(hp.get("texture_damping")) if "texture_damping" in hp else None
         ),
+        loss_floor=_safe_float(hp.get("loss_floor")) if "loss_floor" in hp else None,
         full_res=_safe_bool(hp.get("full_res")),
         use_amp=_safe_bool(hp.get("use_amp")),
         pro_integration_limit=_safe_float(
@@ -561,6 +563,7 @@ def _build_incomplete_record(inv: FolderInventoryEntry) -> ExperimentRecord:
         spatial_dropout=None,
         denoise_prob=None,
         texture_damping=None,
+        loss_floor=None,
         full_res=_safe_bool(parsed.get("full_res")),
         use_amp=None,
         pro_integration_limit=0.3,

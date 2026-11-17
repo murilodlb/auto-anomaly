@@ -138,6 +138,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Weight alpha damping high-variance textures using sqrt(Var(x_hat))",
     )
     parser.add_argument(
+        "--loss-floor",
+        type=float,
+        default=0.006,
+        help="Early-stopping reconstruction loss floor after epoch 20 (0 disables)",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="results",

@@ -56,19 +56,20 @@ echo "[1/2] Running pipeline smoke tests..."
 # Configurable hyperparameters (override via sbatch --export=ALL,VAR=val)
 DATA_DIR="${DATA_DIR:-data}"
 CATEGORY="${CATEGORY:-carpet}"
-EPOCHS="${EPOCHS:-120}"
+EPOCHS="${EPOCHS:-70}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 LR="${LR:-1e-3}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
-LATENT_DIM="${LATENT_DIM:-128}"
+LATENT_DIM="${LATENT_DIM:-64}"
 BASE_CHANNELS="${BASE_CHANNELS:-64}"
 NUM_STAGES="${NUM_STAGES:-6}"
 GAUSSIAN_SIGMA="${GAUSSIAN_SIGMA:-6.0}"
-TOP_K_PCT="${TOP_K_PCT:-0.0005}"
+TOP_K_PCT="${TOP_K_PCT:-0.0004}"
 LOSS="${LOSS:-ms_l1_ssim}"
-SPATIAL_DROPOUT="${SPATIAL_DROPOUT:-0.1}"
+SPATIAL_DROPOUT="${SPATIAL_DROPOUT:-0.25}"
 DENOISE_PROB="${DENOISE_PROB:-0.5}"
 TEXTURE_DAMPING="${TEXTURE_DAMPING:-2.0}"
+LOSS_FLOOR="${LOSS_FLOOR:-0.006}"
 NUM_WORKERS="${SLURM_CPUS_PER_TASK:-8}"
 EXP_NAME="${EXP_NAME:-${CATEGORY}_fullres_${LOSS}_s${NUM_STAGES}_c${BASE_CHANNELS}_z${LATENT_DIM}}"
 
@@ -97,6 +98,7 @@ echo "[2/2] Launching Experiment: ${EXP_NAME} (Category: ${CATEGORY})"
     --spatial-dropout "${SPATIAL_DROPOUT}" \
     --denoise-prob "${DENOISE_PROB}" \
     --texture-damping "${TEXTURE_DAMPING}" \
+    --loss-floor "${LOSS_FLOOR}" \
     --num-workers "${NUM_WORKERS}" \
     --output "${EXP_NAME}" \
     --device cuda \

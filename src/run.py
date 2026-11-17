@@ -188,6 +188,7 @@ def _serialize_hyperparams(config: PipelineConfig) -> dict[str, Any]:
         "spatial_dropout": ae.spatial_dropout,
         "denoise_prob": ae.denoise_prob,
         "texture_damping": ae.texture_damping,
+        "loss_floor": ae.loss_floor,
         "full_res": ds.full_res,
         "grayscale": ds.grayscale,
         "use_amp": ae.use_amp,

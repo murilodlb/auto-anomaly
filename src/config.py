@@ -130,6 +130,7 @@ class AutoencoderConfig:
     spatial_dropout: float = 0.1
     denoise_prob: float = 0.5
     texture_damping: float = 2.0
+    loss_floor: float = 0.006
     use_amp: bool = True
     save_weights: bool = True
     load_weights: Path | None = None
@@ -267,6 +268,8 @@ class PipelineConfig:
             raise ValueError(f"denoise_prob must be in [0.0, 1.0], got {ae.denoise_prob}")
         if ae.texture_damping < 0.0:
             raise ValueError(f"texture_damping must be >= 0, got {ae.texture_damping}")
+        if ae.loss_floor < 0.0:
+            raise ValueError(f"loss_floor must be >= 0, got {ae.loss_floor}")
         if ae.load_weights is not None and not ae.load_weights.is_file():
             raise FileNotFoundError(f"Checkpoint file does not exist: {ae.load_weights}")
 
@@ -329,6 +332,7 @@ class PipelineConfig:
             spatial_dropout=float(kwargs.get("spatial_dropout", 0.1)),
             denoise_prob=float(kwargs.get("denoise_prob", 0.5)),
             texture_damping=float(kwargs.get("texture_damping", 2.0)),
+            loss_floor=float(kwargs.get("loss_floor", 0.006)),
             use_amp=not bool(kwargs.get("no_amp", False)),
             save_weights=not bool(kwargs.get("no_save_weights", False)),
             load_weights=load_weights,

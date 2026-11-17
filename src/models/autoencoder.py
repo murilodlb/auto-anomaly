@@ -202,9 +202,33 @@ def _corrupt_batch(
     for i in range(b):
         if rng.random() >= denoise_prob:
             continue
+        if rng.random() < 0.35:
+            cell_size = min(rng.choice((16, 32)), max(4, min(h, w) // 4))
+            n_rows = max(1, (h + cell_size - 1) // cell_size)
+            n_cols = max(1, (w + cell_size - 1) // cell_size)
+            total_cells = n_rows * n_cols
+            num_masked = max(1, min(total_cells, round(total_cells * rng.uniform(0.15, 0.25))))
+            ch_mean = x_noisy[i].mean(dim=(1, 2), keepdim=True)
+            for cell_idx in rng.sample(range(total_cells), k=num_masked):
+                y0 = (cell_idx // n_cols) * cell_size
+                y1 = min(h, y0 + cell_size)
+                x0 = (cell_idx % n_cols) * cell_size
+                x1 = min(w, x0 + cell_size)
+                jitter = (
+                    torch.randn(
+                        (c, y1 - y0, x1 - x0),
+                        device=device,
+                        dtype=dtype,
+                        generator=torch_gen,
+                    )
+                    * (0.05 * val_span_t)
+                )
+                x_noisy[i, :, y0:y1, x0:x1] = (ch_mean + jitter).clamp(x_min_t, x_max_t)
+            continue
+
         num_patches = rng.randint(1, 3)
         for _ in range(num_patches):
-            target_area = rng.uniform(0.01, 0.18) * float(h * w)
+            target_area = rng.uniform(0.01, 0.16) * float(h * w)
             aspect = math.exp(rng.uniform(min_log_ar, max_log_ar))
             ph = min(h, max(2, round(math.sqrt(target_area * aspect))))
             pw = min(w, max(2, round(math.sqrt(target_area / aspect))))
@@ -245,8 +269,11 @@ def _corrupt_batch(
                 sigma_y = rng.uniform(0.35, 0.55)
                 sigma_x = rng.uniform(0.35, 0.55)
                 gauss_2d = torch.exp(-0.5 * ((yy / sigma_y) ** 2 + (xx / sigma_x) ** 2))
+                stain_factor = (
+                    rng.uniform(0.25, 0.65) if rng.random() < 0.5 else rng.uniform(1.35, 1.75)
+                )
                 stain_scale = torch.tensor(
-                    [rng.uniform(0.2, 1.8) for _ in range(c)],
+                    [max(0.15, stain_factor * rng.uniform(0.85, 1.15)) for _ in range(c)],
                     device=device,
                     dtype=dtype,
                 ).view(c, 1, 1)
@@ -375,6 +402,17 @@ def _gaussian_blur_2d(tensor: torch.Tensor, sigma: float) -> torch.Tensor:
     return torch.nn.functional.conv2d(blurred, kernel_y)
 
 
+def _morphological_open_2d(tensor: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
+    """Apply greyscale 2D morphological opening (erosion followed by dilation)."""
+    pad = kernel_size // 2
+    eroded = -torch.nn.functional.max_pool2d(
+        -tensor, kernel_size=kernel_size, stride=1, padding=pad
+    )
+    return torch.nn.functional.max_pool2d(
+        eroded, kernel_size=kernel_size, stride=1, padding=pad
+    )
+
+
 class RawAutoencoderModel:
     """Training, inference, and anomaly-map scoring wrapper around ConvAutoencoder."""
 
@@ -499,6 +537,9 @@ class RawAutoencoderModel:
                 align_corners=False,
             )
 
+        if min(err_map.shape[-2], err_map.shape[-1]) >= 32:
+            err_map = _morphological_open_2d(err_map, kernel_size=3)
+
         err_map = _gaussian_blur_2d(err_map, self.config.gaussian_sigma)
 
         if apply_calibration and bool(self.net.calibrated.item()):
@@ -508,13 +549,17 @@ class RawAutoencoderModel:
                 mode="bilinear",
                 align_corners=False,
             )
-            std_map = 0.5 * self.net.err_std + 0.5 * torch.nn.functional.interpolate(
-                self.net.normal_std_map,
-                size=err_map.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-            z_map = (err_map - mu_map) / (std_map + 1e-4)
+            std_map = (
+                0.5 * self.net.err_std
+                + 0.5
+                * torch.nn.functional.interpolate(
+                    self.net.normal_std_map,
+                    size=err_map.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            ).clamp(min=1e-4)
+            z_map = (err_map - mu_map) / std_map
             err_map = torch.nn.functional.softplus(z_map - 1.5, beta=2.0)
 
         return x_hat_f32, err_map
@@ -590,6 +635,7 @@ class RawAutoencoderModel:
         )
         num_samples = len(train_images)
         epoch_losses: list[float] = []
+        consecutive_floor_hits = 0
         train_gpu_u8 = self._maybe_preload_train_gpu(train_images, extractor)
 
         try:
@@ -630,6 +676,19 @@ class RawAutoencoderModel:
                     flush=True,
                 )
 
+                if self.config.loss_floor > 0.0 and epoch >= 20:
+                    if avg_loss <= self.config.loss_floor:
+                        consecutive_floor_hits += 1
+                        if consecutive_floor_hits >= 2:
+                            print(
+                                f"[EarlyStop] Reached loss_floor={self.config.loss_floor:.6f} "
+                                f"at epoch {epoch}",
+                                flush=True,
+                            )
+                            break
+                    else:
+                        consecutive_floor_hits = 0
+
             self._calibrate_normal_baseline(train_images, extractor, train_gpu_u8)
         finally:
             del train_gpu_u8
@@ -650,13 +709,12 @@ class RawAutoencoderModel:
                 x, target_hw=target_hw, apply_calibration=True
             )
 
-            flat = err_map.flatten(start_dim=1)
+            score_map = torch.nn.functional.avg_pool2d(err_map, kernel_size=3, stride=1, padding=1)
+            flat = score_map.flatten(start_dim=1)
             k = max(1, math.ceil(flat.shape[1] * self.config.score_top_k_pct))
             top_vals = torch.topk(flat, k=k, dim=1).values
-            image_scores = (
-                0.5 * top_vals.mean(dim=1)
-                + 0.5 * top_vals[:, : max(1, k // 10)].mean(dim=1)
-            )
+            k_core = max(1, math.ceil(k * 0.1))
+            image_scores = 0.5 * top_vals[:, :k_core].mean(dim=1) + 0.5 * top_vals.mean(dim=1)
 
             if hasattr(extractor, "to_uint8_images"):
                 recons_uint8 = extractor.to_uint8_images(x_hat)
