@@ -327,7 +327,7 @@ class ConvAutoencoder(torch.nn.Module):
         stage_channels = [min(base_channels * (2**i), 512) for i in range(num_stages)]
 
         enc_layers: list[torch.nn.Module] = []
-        ch_in = in_channels
+        ch_in = in_channels # Shape: (B, 3, H, W)
         for ch_out in stage_channels:
             enc_layers.extend(
                 [

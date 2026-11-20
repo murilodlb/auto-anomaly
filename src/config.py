@@ -9,8 +9,8 @@ from typing import Any
 import cv2
 
 VALID_LOSS_TYPES = frozenset({"l1", "l2", "smooth_l1", "l1_ssim", "ms_l1_ssim"})
-VALID_EXTRACTORS = frozenset({"raw"})
-VALID_MODELS = frozenset({"autoencoder"})
+VALID_EXTRACTORS = frozenset({"raw", "dinov3"})
+VALID_MODELS = frozenset({"dcae", "wta_ae", "autoencoder"})
 MVTEC_CATEGORIES: tuple[str, ...] = (
     "bottle",
     "cable",
@@ -99,10 +99,16 @@ class ResNetExtractorConfig:
 
 @dataclass(frozen=True)
 class DINOv3ExtractorConfig:
-    """Stub configuration for future DINOv3 patch-token spatial extractor."""
+    """Configuration for the DINOv3 patch-token spatial feature extractor."""
 
-    model_name: str = "dinov3_vitb16"
-    layer: int = -1
+    model_name: str = "facebook/dinov3-vits16-pretrain-lvd1689m"
+    patch_size: int = 16
+    stride: int = 16
+    layers: tuple[int, ...] | None = None
+    prune_registers: bool = False
+    mean_centering_alpha: float = 0.0
+    target_short_edge: int | None = None
+    plain_last_hidden_state: bool = False
 
 
 @dataclass(frozen=True)
@@ -134,6 +140,16 @@ class AutoencoderConfig:
     use_amp: bool = True
     save_weights: bool = True
     load_weights: Path | None = None
+
+
+@dataclass(frozen=True)
+class WTAConfig:
+    """Configuration for the Bottleneck Winner-Take-All (WTA) autoencoder."""
+
+    spatial_window: int = 4
+    lifetime_sparsity: float = 0.2
+    ema_momentum: float = 0.05
+    eval_threshold_scale: float = 0.8
 
 
 @dataclass(frozen=True)
@@ -182,9 +198,10 @@ class PipelineConfig:
 
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     extractor_name: str = "raw"
-    model_name: str = "autoencoder"
+    model_name: str = "dcae"
     extractors: ExtractorsConfig = field(default_factory=ExtractorsConfig)
     autoencoder: AutoencoderConfig = field(default_factory=AutoencoderConfig)
+    wta: WTAConfig = field(default_factory=WTAConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     pro_integration_limit: float = 0.3
     seed: int = 42
@@ -239,15 +256,43 @@ class PipelineConfig:
         if ae.latent_dim < 1 or ae.base_channels < 1:
             raise ValueError("latent_dim and base_channels must be >= 1")
         stride_factor = 2**ae.num_stages
-        if h % stride_factor != 0 or w % stride_factor != 0:
-            raise ValueError(
-                f"image_size {(h, w)} must be divisible by 2**num_stages ({stride_factor})"
-            )
-        if (h // stride_factor) * (w // stride_factor) < 2:
-            raise ValueError(
-                f"image_size {(h, w)} with num_stages={ae.num_stages} yields a 1x1 bottleneck; "
-                "InstanceNorm2d requires bottleneck spatial area >= 2"
-            )
+        if self.extractor_name == "raw":
+            if h % stride_factor != 0 or w % stride_factor != 0:
+                raise ValueError(
+                    f"image_size {(h, w)} must be divisible by 2**num_stages ({stride_factor})"
+                )
+            if (h // stride_factor) * (w // stride_factor) < 2:
+                raise ValueError(
+                    f"image_size {(h, w)} with num_stages={ae.num_stages} yields a 1x1 bottleneck; "
+                    "InstanceNorm2d requires bottleneck spatial area >= 2"
+                )
+        elif self.extractor_name == "dinov3":
+            if self.dataset.grayscale:
+                raise ValueError("DINOv3 extractor requires 3-channel RGB images (grayscale=False)")
+            dv3 = self.extractors.dinov3
+            if dv3.patch_size < 1 or dv3.stride < 1:
+                raise ValueError("dinov3 patch_size and stride must be >= 1")
+            if dv3.mean_centering_alpha < 0.0:
+                raise ValueError("dinov3 mean_centering_alpha must be >= 0.0")
+            if dv3.target_short_edge is not None and dv3.target_short_edge < dv3.patch_size:
+                raise ValueError(
+                    f"dinov3 target_short_edge ({dv3.target_short_edge}) "
+                    f"must be >= patch_size ({dv3.patch_size})"
+                )
+            if dv3.layers is not None and any(layer < 1 for layer in dv3.layers):
+                raise ValueError("All dinov3 layer indices must be >= 1")
+            if dv3.target_short_edge is not None:
+                scale = float(dv3.target_short_edge) / float(min(h, w))
+                scaled_h, scaled_w = round(h * scale), round(w * scale)
+            else:
+                scaled_h, scaled_w = h, w
+            n_h = max(1, (scaled_h - dv3.patch_size) // dv3.stride + 1)
+            n_w = max(1, (scaled_w - dv3.patch_size) // dv3.stride + 1)
+            if (n_h // stride_factor) * (n_w // stride_factor) < 2:
+                raise ValueError(
+                    f"DINOv3 patch grid {(n_h, n_w)} with num_stages={ae.num_stages} "
+                    f"(stride_factor={stride_factor}) is too small for bottleneck spatial area >= 2"
+                )
         if ae.loss_type not in VALID_LOSS_TYPES:
             raise ValueError(
                 f"Unsupported loss_type {ae.loss_type!r}; expected one of {VALID_LOSS_TYPES}"
@@ -272,6 +317,20 @@ class PipelineConfig:
             raise ValueError(f"loss_floor must be >= 0, got {ae.loss_floor}")
         if ae.load_weights is not None and not ae.load_weights.is_file():
             raise FileNotFoundError(f"Checkpoint file does not exist: {ae.load_weights}")
+
+        wta = self.wta
+        if wta.spatial_window < 1:
+            raise ValueError(f"wta.spatial_window must be >= 1, got {wta.spatial_window}")
+        if not (0.0 < wta.lifetime_sparsity <= 1.0):
+            raise ValueError(
+                f"wta.lifetime_sparsity must be in (0.0, 1.0], got {wta.lifetime_sparsity}"
+            )
+        if not (0.0 < wta.ema_momentum <= 1.0):
+            raise ValueError(f"wta.ema_momentum must be in (0.0, 1.0], got {wta.ema_momentum}")
+        if wta.eval_threshold_scale < 0.0:
+            raise ValueError(
+                f"wta.eval_threshold_scale must be >= 0.0, got {wta.eval_threshold_scale}"
+            )
 
         if not (0.0 < self.pro_integration_limit <= 1.0):
             raise ValueError(
@@ -346,11 +405,41 @@ class PipelineConfig:
             save_tiff_maps=bool(kwargs.get("save_tiff", False)),
         )
 
+        dinov3_layers_raw = kwargs.get("dinov3_layers")
+        dinov3_layers = (
+            tuple(int(v) for v in dinov3_layers_raw)
+            if dinov3_layers_raw is not None
+            else None
+        )
+        short_edge_raw = kwargs.get("dinov3_target_short_edge")
+        extractors_cfg = ExtractorsConfig(
+            dinov3=DINOv3ExtractorConfig(
+                model_name=str(
+                    kwargs.get("dinov3_model", "facebook/dinov3-vits16-pretrain-lvd1689m")
+                ),
+                stride=int(kwargs.get("dinov3_stride", 16)),
+                layers=dinov3_layers,
+                prune_registers=bool(kwargs.get("dinov3_prune_registers", False)),
+                mean_centering_alpha=float(kwargs.get("dinov3_mean_center_alpha", 0.0)),
+                target_short_edge=int(short_edge_raw) if short_edge_raw is not None else None,
+                plain_last_hidden_state=bool(kwargs.get("dinov3_plain_last_hidden_state", False)),
+            )
+        )
+
+        wta_cfg = WTAConfig(
+            spatial_window=int(kwargs.get("wta_spatial_window", 4)),
+            lifetime_sparsity=float(kwargs.get("wta_lifetime_sparsity", 0.2)),
+            ema_momentum=float(kwargs.get("wta_ema_momentum", 0.05)),
+            eval_threshold_scale=float(kwargs.get("wta_eval_scale", 0.8)),
+        )
+
         return cls(
             dataset=dataset_cfg,
             extractor_name=str(kwargs.get("extractor", "raw")),
-            model_name=str(kwargs.get("model", "autoencoder")),
+            model_name=str(kwargs.get("model", "dcae")),
+            extractors=extractors_cfg,
             autoencoder=ae_cfg,
+            wta=wta_cfg,
             output=output_cfg,
             pro_integration_limit=float(kwargs.get("pro_limit", 0.3)),
             seed=int(kwargs.get("seed", 42)),

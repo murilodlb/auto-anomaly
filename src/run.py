@@ -174,7 +174,9 @@ def _serialize_hyperparams(config: PipelineConfig) -> dict[str, Any]:
     ae = config.autoencoder
     ds = config.dataset
     raw = config.extractors.raw
-    return {
+    payload: dict[str, Any] = {
+        "model": config.model_name,
+        "extractor": config.extractor_name,
         "loss_type": ae.loss_type,
         "num_stages": ae.num_stages,
         "base_channels": ae.base_channels,
@@ -197,6 +199,30 @@ def _serialize_hyperparams(config: PipelineConfig) -> dict[str, Any]:
         "pro_integration_limit": config.pro_integration_limit,
         "seed": config.seed,
     }
+    if config.model_name == "wta_ae":
+        wta = config.wta
+        payload.update(
+            {
+                "wta_spatial_window": wta.spatial_window,
+                "wta_lifetime_sparsity": wta.lifetime_sparsity,
+                "wta_ema_momentum": wta.ema_momentum,
+                "wta_eval_threshold_scale": wta.eval_threshold_scale,
+            }
+        )
+    if config.extractor_name == "dinov3":
+        dv3 = config.extractors.dinov3
+        payload.update(
+            {
+                "dinov3_model": dv3.model_name,
+                "dinov3_stride": dv3.stride,
+                "dinov3_layers": list(dv3.layers) if dv3.layers is not None else None,
+                "dinov3_prune_registers": dv3.prune_registers,
+                "dinov3_mean_centering_alpha": dv3.mean_centering_alpha,
+                "dinov3_target_short_edge": dv3.target_short_edge,
+                "dinov3_plain_last_hidden_state": dv3.plain_last_hidden_state,
+            }
+        )
+    return payload
 
 
 def _run_single_category(
@@ -219,11 +245,19 @@ def _run_single_category(
         f"image_size={config.dataset.image_size}, device={device}"
     )
     ae_cfg = config.autoencoder
+    wta_info = (
+        f", wta_window={config.wta.spatial_window}, "
+        f"wta_lifetime={config.wta.lifetime_sparsity:g}, "
+        f"wta_eval_scale={config.wta.eval_threshold_scale:g}"
+        if config.model_name == "wta_ae"
+        else ""
+    )
     print(
-        f"Autoencoder config: loss={ae_cfg.loss_type}, stages={ae_cfg.num_stages}, "
-        f"base_ch={ae_cfg.base_channels}, latent={ae_cfg.latent_dim}, "
-        f"dropout={ae_cfg.spatial_dropout:g}, denoise={ae_cfg.denoise_prob:g}, "
-        f"texture_damping={ae_cfg.texture_damping:g}"
+        f"Autoencoder ({config.model_name}) config: loss={ae_cfg.loss_type}, "
+        f"stages={ae_cfg.num_stages}, base_ch={ae_cfg.base_channels}, "
+        f"latent={ae_cfg.latent_dim}, dropout={ae_cfg.spatial_dropout:g}, "
+        f"denoise={ae_cfg.denoise_prob:g}, texture_damping={ae_cfg.texture_damping:g}"
+        f"{wta_info}"
     )
 
     extractor = get_extractor(config, device)

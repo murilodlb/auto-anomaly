@@ -20,6 +20,7 @@ _NAN = float("nan")
 
 _NAME_HP_PATTERN = re.compile(
     r"^(?P<prefix>.+?)_"
+    r"(?:(?P<model>wta_ae|dcae)_)?"
     r"(?:(?P<res>fullres|\d+x\d+)_)?"
     r"(?P<loss>ms_l1_ssim|l1_ssim|l1ssim|smooth_l1|l1|l2)_"
     r"s(?P<stages>\d+)"
@@ -57,6 +58,7 @@ class ExperimentRecord:
     experiment_name: str
     parent_experiment: str
     category: str
+    model: str
     status: str
     updated_at: str
     device: str
@@ -78,6 +80,8 @@ class ExperimentRecord:
     denoise_prob: float | None
     texture_damping: float | None
     loss_floor: float | None
+    wta_spatial_window: int | None
+    wta_lifetime_sparsity: float | None
     full_res: bool | None
     use_amp: bool | None
     pro_integration_limit: float
@@ -217,6 +221,8 @@ def parse_experiment_name_hyperparams(name: str) -> dict[str, Any]:
         "loss_type": loss_norm,
         "num_stages": int(match.group("stages")),
     }
+    if match.group("model") is not None:
+        parsed["model"] = match.group("model")
     if res_raw == "fullres":
         parsed["full_res"] = True
     if match.group("base_ch") is not None:
@@ -435,10 +441,16 @@ def _build_record_from_run_dir(
         run_dir.name if parent_experiment else ""
     )
 
+    parsed_name = parse_experiment_name_hyperparams(
+        experiment_name
+    ) or parse_experiment_name_hyperparams(parent_experiment)
+    model_name = str(hp.get("model") or parsed_name.get("model") or payload.get("model") or "")
+
     rec = ExperimentRecord(
         experiment_name=experiment_name,
         parent_experiment=parent_experiment,
         category=category,
+        model=model_name,
         status="complete",
         updated_at=_format_timestamp(latest_mtime),
         device=str(payload.get("device", "")),
@@ -468,6 +480,12 @@ def _build_record_from_run_dir(
             _safe_float(hp.get("texture_damping")) if "texture_damping" in hp else None
         ),
         loss_floor=_safe_float(hp.get("loss_floor")) if "loss_floor" in hp else None,
+        wta_spatial_window=_safe_int(hp.get("wta_spatial_window")),
+        wta_lifetime_sparsity=(
+            _safe_float(hp.get("wta_lifetime_sparsity"))
+            if "wta_lifetime_sparsity" in hp
+            else None
+        ),
         full_res=_safe_bool(hp.get("full_res")),
         use_amp=_safe_bool(hp.get("use_amp")),
         pro_integration_limit=_safe_float(
@@ -543,6 +561,7 @@ def _build_incomplete_record(inv: FolderInventoryEntry) -> ExperimentRecord:
         experiment_name=inv.folder_name,
         parent_experiment="",
         category=inferred_cat,
+        model=str(parsed.get("model", "")),
         status=inv.status,
         updated_at=inv.updated_at,
         device="",
@@ -564,6 +583,8 @@ def _build_incomplete_record(inv: FolderInventoryEntry) -> ExperimentRecord:
         denoise_prob=None,
         texture_damping=None,
         loss_floor=None,
+        wta_spatial_window=None,
+        wta_lifetime_sparsity=None,
         full_res=_safe_bool(parsed.get("full_res")),
         use_amp=None,
         pro_integration_limit=0.3,
@@ -801,9 +822,10 @@ def format_leaderboard_table(records: list[ExperimentRecord], top: int | None = 
 
     name_w = max(26, min(42, max(len(r.experiment_name) for r in shown) + 2))
     header = (
-        f"{'Experiment':<{name_w}} {'Category':<10} {'Loss':<10} {'S':>2} {'C':>3} {'Z':>3} "
-        f"{'Ep':>3} {'Dmp':>4} {'Dns':>4} {'AU-PRO':>7} {'ROC(max)':>8} "
-        f"{'ROC(k%)':>7} {'PixROC':>7} {'PixAP':>6} {'GoodMu':>7} {'DefMu':>7} {'s/ep':>6}"
+        f"{'Experiment':<{name_w}} {'Category':<10} {'Model':<11} {'Loss':<10} "
+        f"{'S':>2} {'C':>3} {'Z':>3} {'Ep':>3} {'Dmp':>4} {'Dns':>4} {'AU-PRO':>7} "
+        f"{'ROC(max)':>8} {'ROC(k%)':>7} {'PixROC':>7} {'PixAP':>6} {'GoodMu':>7} "
+        f"{'DefMu':>7} {'s/ep':>6}"
     )
     sep = "-" * len(header)
     lines = ["Experiment Metrics & Hyperparameter Leaderboard", sep, header, sep]
@@ -814,9 +836,10 @@ def format_leaderboard_table(records: list[ExperimentRecord], top: int | None = 
             else r.experiment_name[: name_w - 3] + "..."
         )
         cat = r.category or "-"
+        mdl = (r.model or "-")[:11]
         loss = r.loss_type or "-"
         lines.append(
-            f"{name:<{name_w}} {cat:<10} {loss:<10} "
+            f"{name:<{name_w}} {cat:<10} {mdl:<11} {loss:<10} "
             f"{_fmt_opt_int(r.num_stages, 2)} {_fmt_opt_int(r.base_channels, 3)} "
             f"{_fmt_opt_int(r.latent_dim, 3)} {_fmt_opt_int(r.epochs, 3)} "
             f"{_fmt_opt_flt(r.texture_damping, 4)} {_fmt_opt_flt(r.denoise_prob, 4)} "

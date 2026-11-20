@@ -39,8 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         type=str,
         choices=sorted(MODEL_NAMES),
-        default="autoencoder",
-        help="Anomaly detection model name",
+        default="dcae",
+        help="Anomaly detection model name (dcae, wta_ae, or legacy alias autoencoder)",
     )
     parser.add_argument(
         "--image-size",
@@ -169,6 +169,65 @@ def build_parser() -> argparse.ArgumentParser:
         "--summarize-results",
         action="store_true",
         help="Inspect --output-dir contents, print leaderboard, and export comparison CSVs",
+    )
+    parser.add_argument(
+        "--dinov3-model",
+        type=str,
+        default="facebook/dinov3-vits16-pretrain-lvd1689m",
+        help="HuggingFace model ID for DINOv3 extractor",
+    )
+    parser.add_argument(
+        "--dinov3-stride",
+        type=int,
+        default=16,
+        help="Patch embedding stride for DINOv3 (e.g. 16 default, 12/14 overlap)",
+    )
+    parser.add_argument(
+        "--dinov3-layers",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Optional 1-based transformer layer indices for multi-layer DINOv3 fusion",
+    )
+    parser.add_argument(
+        "--dinov3-prune-registers",
+        action="store_true",
+        help="Prune DINOv3 register tokens via embeddings forward hook",
+    )
+    parser.add_argument(
+        "--dinov3-mean-center-alpha",
+        type=float,
+        default=0.0,
+        help="Hypersphere mean-centering alpha before L2 normalization",
+    )
+    parser.add_argument(
+        "--dinov3-target-short-edge",
+        type=int,
+        default=None,
+        help="Optional short-edge target size before DINOv3 patch grid alignment",
+    )
+    parser.add_argument(
+        "--dinov3-plain-last-hidden-state",
+        action="store_true",
+        help="Disable 3x3 neighborhood AvgPool2d smoothing on DINOv3 patch tokens",
+    )
+    parser.add_argument(
+        "--wta-spatial-window",
+        type=int,
+        default=4,
+        help="Non-overlapping spatial winner window size for wta_ae bottleneck",
+    )
+    parser.add_argument(
+        "--wta-lifetime-sparsity",
+        type=float,
+        default=0.2,
+        help="Mini-batch lifetime winner fraction in (0.0, 1.0] for wta_ae bottleneck",
+    )
+    parser.add_argument(
+        "--wta-eval-scale",
+        type=float,
+        default=0.8,
+        help="Test-time EMA threshold scale factor for wta_ae eval() mode",
     )
     return parser
 

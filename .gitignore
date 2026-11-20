@@ -15,3 +15,6 @@ data/hazelnut/
 data/bottle/
 data/transistor/
 prompt.txt
+.env
+!README.md
+*.md

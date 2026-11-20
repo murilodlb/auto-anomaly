@@ -16,11 +16,14 @@ from src.__main__ import build_parser
 from src.config import (
     AutoencoderConfig,
     DatasetConfig,
+    DINOv3ExtractorConfig,
     OutputConfig,
     PipelineConfig,
     RawExtractorConfig,
+    WTAConfig,
 )
 from src.dataset import iter_batches, load_mvtec_category
+from src.extractors.dinov3 import DINOv3Extractor
 from src.extractors.raw import RawPixelExtractor
 from src.metrics import (
     compute_au_pro,
@@ -29,7 +32,8 @@ from src.metrics import (
     compute_pro_curve,
     trapezoid,
 )
-from src.models.autoencoder import (
+from src.models import get_model
+from src.models.dcae import (
     ConvAutoencoder,
     RawAutoencoderModel,
     _compute_raw_error_map,
@@ -40,6 +44,7 @@ from src.models.autoencoder import (
     _ms_l1_ssim_loss,
     _ssim_map,
 )
+from src.models.wta_ae import WTAAutoencoderModel, WTAConvAutoencoder, WTASparsity2d
 from src.results import inspect_results_folders, scan_results
 from src.results import main as results_main
 from src.run import run_pipeline
@@ -906,3 +911,310 @@ def test_loss_floor_early_stopping_and_cli_flag(tmp_path: Path) -> None:
     losses = model.fit(train_u8, extractor)
     assert len(losses) == 21
     assert bool(model.net.calibrated.item()) is True
+
+
+class _MockRoPE(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_hw: tuple[int, int] | None = None
+
+    def forward(self, pixel_values: torch.Tensor) -> tuple[int, int]:
+        self.last_hw = (pixel_values.shape[-2], pixel_values.shape[-1])
+        return self.last_hw
+
+
+class _MockDINOv3Embeddings(torch.nn.Module):
+    def __init__(self, hidden_size: int = 32, num_registers: int = 4) -> None:
+        super().__init__()
+        self.patch_embeddings = torch.nn.Conv2d(3, hidden_size, kernel_size=16, stride=16)
+        self.rope_embeddings = _MockRoPE()
+        self.num_registers = num_registers
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        self.rope_embeddings(pixel_values)
+        feats = self.patch_embeddings(pixel_values).flatten(2).transpose(1, 2)
+        b, _, d = feats.shape
+        cls_and_regs = torch.ones((b, 1 + self.num_registers, d), device=feats.device)
+        return torch.cat([cls_and_regs, feats], dim=1)
+
+
+class _MockDINOv3Model(torch.nn.Module):
+    def __init__(self, hidden_size: int = 32, num_registers: int = 4) -> None:
+        super().__init__()
+        from types import SimpleNamespace
+
+        self.config = SimpleNamespace(hidden_size=hidden_size, num_register_tokens=num_registers)
+        self.embeddings = _MockDINOv3Embeddings(
+            hidden_size=hidden_size, num_registers=num_registers
+        )
+        self.layernorm = torch.nn.LayerNorm(hidden_size)
+
+    def forward(
+        self, pixel_values: torch.Tensor, output_hidden_states: bool = False
+    ) -> object:
+        from types import SimpleNamespace
+
+        tokens = self.embeddings(pixel_values)
+        normed = self.layernorm(tokens)
+        if output_hidden_states:
+            return SimpleNamespace(
+                last_hidden_state=normed,
+                hidden_states=[tokens * (0.5 * i + 1.0) for i in range(5)],
+            )
+        return SimpleNamespace(last_hidden_state=normed, hidden_states=None)
+
+
+def test_dinov3_extractor_features_and_autoencoder_roundtrip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    mock_proc = SimpleNamespace(image_mean=[0.485, 0.456, 0.406], image_std=[0.229, 0.224, 0.225])
+
+    def _fake_load(self: DINOv3Extractor) -> tuple[_MockDINOv3Model, SimpleNamespace]:
+        m = _MockDINOv3Model(hidden_size=32, num_registers=4)
+        m.eval()
+        m._native_num_registers = 4  # type: ignore[attr-defined]
+        self._apply_patch_stride(m)
+        self._configure_register_pruning(m)
+        return m, mock_proc
+
+    monkeypatch.setattr(DINOv3Extractor, "_load_model", _fake_load)
+
+    ds_cfg = DatasetConfig(image_size=(128, 128), batch_size=2)
+    dv3_cfg = DINOv3ExtractorConfig(
+        model_name="mock/dinov3-small",
+        stride=8,
+        layers=(2, 4),
+        prune_registers=True,
+        mean_centering_alpha=0.5,
+        plain_last_hidden_state=False,
+    )
+    device = torch.device("cpu")
+    extractor = DINOv3Extractor(ds_cfg, dv3_cfg, device=device, stride_factor=4)
+
+    # (128 - 16) // 8 + 1 = 15 -> aligned down to multiple of 4 => 12x12 patches
+    assert extractor.spatial_shape == (12, 12)
+    assert extractor.out_channels == 64  # 32 * 2 layers
+    assert extractor.is_unit_range is False
+
+    rng = np.random.default_rng(11)
+    imgs = rng.integers(0, 255, size=(2, 128, 128, 3), dtype=np.uint8)
+    feats = extractor.extract_batch(imgs)
+    assert feats.shape == (2, 64, 12, 12)
+    assert feats.dtype == torch.float32
+    norms = torch.linalg.vector_norm(feats, dim=1)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+
+    # Check RoPE received dummy pixel dimensions matching (h_p * patch_size)
+    model_obj, _ = extractor._components
+    assert model_obj.embeddings.rope_embeddings.last_hw == (12 * 16, 12 * 16)
+
+    # Autoencoder roundtrip with DINOv3 feature maps (use_sigmoid=False)
+    ae_cfg = AutoencoderConfig(
+        latent_dim=16,
+        base_channels=16,
+        num_stages=2,
+        loss_type="l2",
+        epochs=2,
+        denoise_prob=0.5,
+    )
+    ae = RawAutoencoderModel(
+        in_channels=extractor.out_channels,
+        config=ae_cfg,
+        device=device,
+        batch_size=2,
+        use_sigmoid=extractor.is_unit_range,
+    )
+    losses = ae.fit(imgs, extractor)
+    assert len(losses) == 2
+    scores, amaps, recons = ae.predict_batch(imgs, extractor, target_hw=(128, 128))
+    assert scores.shape == (2,)
+    assert amaps.shape == (2, 128, 128)
+    assert recons.shape == (2, 128, 128, 3) and recons.dtype == np.uint8
+
+
+def test_dinov3_cli_and_config_validation(tmp_path: Path) -> None:
+    data_root = _create_synthetic_mvtec(tmp_path)
+    args = build_parser().parse_args(
+        [
+            "--data-dir",
+            str(data_root),
+            "--extractor",
+            "dinov3",
+            "--image-size",
+            "256",
+            "256",
+            "--num-stages",
+            "3",
+            "--dinov3-stride",
+            "14",
+            "--dinov3-layers",
+            "6",
+            "12",
+            "--dinov3-prune-registers",
+            "--dinov3-mean-center-alpha",
+            "0.5",
+            "--device",
+            "cpu",
+        ]
+    )
+    cfg = PipelineConfig.from_args(**vars(args))
+    cfg.validate()
+    assert cfg.extractor_name == "dinov3"
+    assert cfg.extractors.dinov3.stride == 14
+    assert cfg.extractors.dinov3.layers == (6, 12)
+    assert cfg.extractors.dinov3.prune_registers is True
+    assert cfg.extractors.dinov3.mean_centering_alpha == pytest.approx(0.5)
+
+    # Grayscale rejected for DINOv3
+    gray_cfg = PipelineConfig(
+        dataset=DatasetConfig(root_dir=data_root, grayscale=True, image_size=(256, 256)),
+        extractor_name="dinov3",
+        autoencoder=AutoencoderConfig(num_stages=3),
+        device="cpu",
+    )
+    with pytest.raises(ValueError, match="RGB"):
+        gray_cfg.validate()
+
+    # Too many AE stages for DINOv3 patch grid rejected
+    deep_cfg = PipelineConfig(
+        dataset=DatasetConfig(root_dir=data_root, image_size=(256, 256)),
+        extractor_name="dinov3",
+        autoencoder=AutoencoderConfig(num_stages=4),
+        device="cpu",
+    )
+    with pytest.raises(ValueError, match="patch grid"):
+        deep_cfg.validate()
+
+
+def test_wta_sparsity_spatial_and_lifetime_exactness() -> None:
+    torch.manual_seed(0)
+    b, ch, hb, wb = 4, 8, 16, 16
+    # Strictly distinct positive activations per slot to verify exact winner counts
+    z = (torch.rand((b, ch, hb, wb), dtype=torch.float32) + 0.1).requires_grad_(True)
+    wta = WTASparsity2d(num_channels=ch, spatial_window=4, lifetime_sparsity=0.25)
+    wta.train()
+
+    out = wta(z)
+    assert out.shape == z.shape
+
+    # Each 4x4 window must contain at most 1 non-zero winner
+    blocks = out.unfold(2, 4, 4).unfold(3, 4, 4)  # Shape: (B, C, 4, 4, 4, 4)
+    per_block_nz = (blocks > 0.0).sum(dim=(-1, -2))
+    assert int(per_block_nz.max().item()) <= 1
+
+    # Lifetime sparsity across N_slots = 4 * 4 * 4 = 64 -> k = ceil(64 * 0.25) = 16 per channel
+    per_channel_nz = (out > 0.0).sum(dim=(0, 2, 3))
+    assert torch.all(per_channel_nz == 16)
+    assert bool(wta.threshold_initialized.item()) is True
+    assert bool((wta.running_threshold > 0.0).all().item())
+
+    # Verify gradients flow exclusively through active winners
+    out.sum().backward()
+    assert z.grad is not None
+    assert torch.isfinite(z.grad).all()
+    inactive = out.detach() == 0.0
+    assert torch.all(z.grad[inactive] == 0.0)
+
+
+def test_wta_eval_batch_size_independence() -> None:
+    torch.manual_seed(3)
+    net = WTAConvAutoencoder(
+        in_channels=3,
+        base_channels=8,
+        latent_dim=16,
+        num_stages=3,
+        spatial_window=4,
+        lifetime_sparsity=0.25,
+    )
+    x = torch.rand((4, 3, 64, 64), dtype=torch.float32)
+    net.train()
+    _ = net(x)
+    assert bool(net.wta.threshold_initialized.item()) is True
+
+    net.eval()
+    with torch.inference_mode():
+        out_single = net(x[:1])
+        out_batch = net(x)
+    assert out_single.shape == (1, 3, 64, 64)
+    assert torch.allclose(out_single, out_batch[:1], atol=1e-6)
+
+
+def test_wta_ae_pipeline_checkpoint_and_dcae_alias(tmp_path: Path) -> None:
+    data_root = _create_synthetic_mvtec(tmp_path / "data")
+    out_base = tmp_path / "results"
+
+    cfg = PipelineConfig(
+        dataset=DatasetConfig(root_dir=data_root, image_size=(64, 64), batch_size=2, num_workers=1),
+        model_name="wta_ae",
+        autoencoder=AutoencoderConfig(
+            latent_dim=16,
+            base_channels=8,
+            num_stages=3,
+            loss_type="l2",
+            epochs=2,
+            gaussian_sigma=1.0,
+        ),
+        wta=WTAConfig(spatial_window=2, lifetime_sparsity=0.25, eval_threshold_scale=0.8),
+        output=OutputConfig(
+            base_dir=out_base,
+            experiment_name="wta_smoke",
+            save_visualizations=False,
+        ),
+        device="cpu",
+    )
+    payload = run_pipeline(cfg)
+    ckpt_path = out_base / "wta_smoke" / "weights" / "model.pt"
+    assert ckpt_path.is_file()
+
+    saved = json.loads((out_base / "wta_smoke" / "metrics.json").read_text(encoding="utf-8"))
+    assert saved["hyperparams"]["model"] == "wta_ae"
+    assert saved["hyperparams"]["wta_spatial_window"] == 2
+    assert saved["hyperparams"]["wta_lifetime_sparsity"] == pytest.approx(0.25)
+
+    reload_cfg = PipelineConfig(
+        dataset=cfg.dataset,
+        model_name="wta_ae",
+        autoencoder=AutoencoderConfig(
+            latent_dim=16,
+            base_channels=8,
+            num_stages=3,
+            loss_type="l2",
+            epochs=2,
+            gaussian_sigma=1.0,
+            load_weights=ckpt_path,
+        ),
+        wta=cfg.wta,
+        output=OutputConfig(
+            base_dir=out_base,
+            experiment_name="wta_smoke_reload",
+            save_visualizations=False,
+        ),
+        device="cpu",
+    )
+    reloaded_payload = run_pipeline(reload_cfg)
+    assert reloaded_payload["metrics"]["image_auroc"] == pytest.approx(
+        payload["metrics"]["image_auroc"]
+    )
+
+    reloaded_model = WTAAutoencoderModel(
+        in_channels=3,
+        config=reload_cfg.autoencoder,
+        device=torch.device("cpu"),
+        wta_config=cfg.wta,
+        batch_size=2,
+    )
+    reloaded_model.load(ckpt_path)
+    assert bool(reloaded_model.net.wta.threshold_initialized.item()) is True
+
+    # Backward-compatible 'autoencoder' alias resolves cleanly to DCAE RawAutoencoderModel
+    alias_cfg = PipelineConfig(
+        dataset=cfg.dataset,
+        model_name="autoencoder",
+        autoencoder=AutoencoderConfig(latent_dim=16, base_channels=8, num_stages=3, epochs=1),
+        device="cpu",
+    )
+    alias_cfg.validate()
+    alias_model = get_model(alias_cfg, in_channels=3, device=torch.device("cpu"))
+    assert type(alias_model) is RawAutoencoderModel

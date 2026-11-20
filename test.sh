@@ -8,13 +8,13 @@
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 
-# sbatch --export=ALL,CATEGORY=carpet,LOSS=l1_ssim,NUM_STAGES=4,BASE_CHANNELS=64,LATENT_DIM=256,BATCH_SIZE=16,EPOCHS=100,GAUSSIAN_SIGMA=8.0,TOP_K_PCT=0.001 test.sh
-# sbatch --export=ALL,CATEGORY=hazelnut,LOSS=l1_ssim,NUM_STAGES=5,BASE_CHANNELS=48,LATENT_DIM=128,BATCH_SIZE=16,EPOCHS=100,GAUSSIAN_SIGMA=12.0,TOP_K_PCT=0.001 test.sh
-# sbatch --export=ALL,CATEGORY=bottle,LOSS=l1_ssim,NUM_STAGES=5,BASE_CHANNELS=48,LATENT_DIM=128,BATCH_SIZE=16,EPOCHS=100,GAUSSIAN_SIGMA=12.0,TOP_K_PCT=0.001 test.sh
 # sbatch --export=ALL,CATEGORY=all,LOSS=l1_ssim,NUM_STAGES=5,BASE_CHANNELS=64,LATENT_DIM=128,BATCH_SIZE=16,EPOCHS=100,GAUSSIAN_SIGMA=10.0,TOP_K_PCT=0.001,SAVE_TIFF=1,EXP_NAME=mvtec_fullres_l1ssim_s5 test.sh
-# for loss_fn in l2 l1 l1_ssim; do
-    # sbatch --export=ALL,CATEGORY=carpet,LOSS="${loss_fn}",NUM_STAGES=4,BASE_CHANNELS=64,LATENT_DIM=256,BATCH_SIZE=16,EPOCHS=200,GAUSSIAN_SIGMA=8.0,TOP_K_PCT=0.001 test.sh
-# done
+# sbatch --export=ALL,CATEGORY=carpet,EXTRACTOR=dinov3,LOSS=l2,NUM_STAGES=4,BASE_CHANNELS=128,LATENT_DIM=64,BATCH_SIZE=16,EPOCHS=100,GAUSSIAN_SIGMA=8.0,TOP_K_PCT=0.001,DINOV3_STRIDE=16,DINOV3_PRUNE_REGISTERS=1,EXP_NAME=carpet_dinov3_l2_s4_c128_z64 test.sh
+# Compare DCAE vs Bottleneck-WTA ConvAE (wta_ae) on carpet at 1024x1024:
+# sbatch --export=ALL,CATEGORY=carpet,MODEL=dcae,LOSS=ms_l1_ssim,NUM_STAGES=6,BASE_CHANNELS=64,LATENT_DIM=64,EPOCHS=70,SPATIAL_DROPOUT=0.25,TOP_K_PCT=0.0004,GAUSSIAN_SIGMA=6.0 test.sh
+# sbatch --export=ALL,CATEGORY=carpet,MODEL=wta_ae,LOSS=ms_l1_ssim,NUM_STAGES=6,BASE_CHANNELS=64,LATENT_DIM=64,EPOCHS=70,WTA_SPATIAL_WINDOW=4,WTA_LIFETIME_SPARSITY=0.2,WTA_EVAL_SCALE=0.8,TOP_K_PCT=0.0004,GAUSSIAN_SIGMA=6.0 test.sh
+# sbatch --export=ALL,CATEGORY=carpet,MODEL=wta_ae,LOSS=l1_ssim,NUM_STAGES=5,BASE_CHANNELS=64,LATENT_DIM=128,EPOCHS=100,WTA_SPATIAL_WINDOW=4,WTA_LIFETIME_SPARSITY=0.1,WTA_EVAL_SCALE=0.8,TOP_K_PCT=0.0005,GAUSSIAN_SIGMA=8.0 test.sh
+# sbatch --export=ALL,CATEGORY=carpet,MODEL=wta_ae,LOSS=ms_l1_ssim,NUM_STAGES=6,BASE_CHANNELS=64,LATENT_DIM=128,EPOCHS=80,WTA_SPATIAL_WINDOW=2,WTA_LIFETIME_SPARSITY=0.15,WTA_EVAL_SCALE=0.8,TOP_K_PCT=0.0004,GAUSSIAN_SIGMA=6.0 test.sh
 
 set -euo pipefail
 
@@ -56,6 +56,8 @@ echo "[1/2] Running pipeline smoke tests..."
 # Configurable hyperparameters (override via sbatch --export=ALL,VAR=val)
 DATA_DIR="${DATA_DIR:-data}"
 CATEGORY="${CATEGORY:-carpet}"
+EXTRACTOR="${EXTRACTOR:-raw}"
+MODEL="${MODEL:-dcae}"
 EPOCHS="${EPOCHS:-70}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 LR="${LR:-1e-3}"
@@ -70,8 +72,15 @@ SPATIAL_DROPOUT="${SPATIAL_DROPOUT:-0.25}"
 DENOISE_PROB="${DENOISE_PROB:-0.5}"
 TEXTURE_DAMPING="${TEXTURE_DAMPING:-2.0}"
 LOSS_FLOOR="${LOSS_FLOOR:-0.006}"
+WTA_SPATIAL_WINDOW="${WTA_SPATIAL_WINDOW:-4}"
+WTA_LIFETIME_SPARSITY="${WTA_LIFETIME_SPARSITY:-0.2}"
+WTA_EVAL_SCALE="${WTA_EVAL_SCALE:-0.8}"
 NUM_WORKERS="${SLURM_CPUS_PER_TASK:-8}"
-EXP_NAME="${EXP_NAME:-${CATEGORY}_fullres_${LOSS}_s${NUM_STAGES}_c${BASE_CHANNELS}_z${LATENT_DIM}}"
+if [[ "${EXTRACTOR}" == "raw" ]]; then
+    EXP_NAME="${EXP_NAME:-${CATEGORY}_${MODEL}_fullres_${LOSS}_s${NUM_STAGES}_c${BASE_CHANNELS}_z${LATENT_DIM}}"
+else
+    EXP_NAME="${EXP_NAME:-${CATEGORY}_${MODEL}_fullres_${EXTRACTOR}_${LOSS}_s${NUM_STAGES}_c${BASE_CHANNELS}_z${LATENT_DIM}}"
+fi
 
 EXTRA_ARGS=()
 if [[ "${FULL_RES:-1}" == "1" ]]; then
@@ -80,11 +89,37 @@ fi
 if [[ "${SAVE_TIFF:-0}" == "1" ]]; then
     EXTRA_ARGS+=(--save-tiff)
 fi
+if [[ "${EXTRACTOR}" == "dinov3" ]]; then
+    if [[ -n "${DINOV3_MODEL:-}" ]]; then
+        EXTRA_ARGS+=(--dinov3-model "${DINOV3_MODEL}")
+    fi
+    if [[ -n "${DINOV3_STRIDE:-}" ]]; then
+        EXTRA_ARGS+=(--dinov3-stride "${DINOV3_STRIDE}")
+    fi
+    if [[ -n "${DINOV3_LAYERS:-}" ]]; then
+        read -r -a _dinov3_layers_arr <<< "${DINOV3_LAYERS}"
+        EXTRA_ARGS+=(--dinov3-layers "${_dinov3_layers_arr[@]}")
+    fi
+    if [[ "${DINOV3_PRUNE_REGISTERS:-0}" == "1" ]]; then
+        EXTRA_ARGS+=(--dinov3-prune-registers)
+    fi
+    if [[ -n "${DINOV3_MEAN_CENTER_ALPHA:-}" ]]; then
+        EXTRA_ARGS+=(--dinov3-mean-center-alpha "${DINOV3_MEAN_CENTER_ALPHA}")
+    fi
+    if [[ -n "${DINOV3_TARGET_SHORT_EDGE:-}" ]]; then
+        EXTRA_ARGS+=(--dinov3-target-short-edge "${DINOV3_TARGET_SHORT_EDGE}")
+    fi
+    if [[ "${DINOV3_PLAIN_LAST_HIDDEN_STATE:-0}" == "1" ]]; then
+        EXTRA_ARGS+=(--dinov3-plain-last-hidden-state)
+    fi
+fi
 
-echo "[2/2] Launching Experiment: ${EXP_NAME} (Category: ${CATEGORY})"
+echo "[2/2] Launching Experiment: ${EXP_NAME} (Category: ${CATEGORY}, Model: ${MODEL}, Extractor: ${EXTRACTOR})"
 "${PYTHON_RUN[@]}" -m src \
     --data-dir "${DATA_DIR}" \
     --category "${CATEGORY}" \
+    --extractor "${EXTRACTOR}" \
+    --model "${MODEL}" \
     --epochs "${EPOCHS}" \
     --batch-size "${BATCH_SIZE}" \
     --lr "${LR}" \
@@ -99,6 +134,9 @@ echo "[2/2] Launching Experiment: ${EXP_NAME} (Category: ${CATEGORY})"
     --denoise-prob "${DENOISE_PROB}" \
     --texture-damping "${TEXTURE_DAMPING}" \
     --loss-floor "${LOSS_FLOOR}" \
+    --wta-spatial-window "${WTA_SPATIAL_WINDOW}" \
+    --wta-lifetime-sparsity "${WTA_LIFETIME_SPARSITY}" \
+    --wta-eval-scale "${WTA_EVAL_SCALE}" \
     --num-workers "${NUM_WORKERS}" \
     --output "${EXP_NAME}" \
     --device cuda \
