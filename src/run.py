@@ -191,6 +191,8 @@ def _serialize_hyperparams(config: PipelineConfig) -> dict[str, Any]:
         "denoise_prob": ae.denoise_prob,
         "texture_damping": ae.texture_damping,
         "loss_floor": ae.loss_floor,
+        "guided_filter_radius": ae.guided_filter_radius,
+        "guided_filter_eps": ae.guided_filter_eps,
         "full_res": ds.full_res,
         "grayscale": ds.grayscale,
         "use_amp": ae.use_amp,
@@ -297,6 +299,10 @@ def _run_single_category(
                 f"err_std={calibration_info['err_std']:.6f}"
             )
 
+    has_wta = hasattr(model, "net") and hasattr(model.net, "wta")
+    if has_wta:
+        model.net.wta.reset_density_stats(mode="eval")
+
     t_infer = time.perf_counter()
     score_batches: list[np.ndarray] = []
     map_batches: list[np.ndarray] = []
@@ -314,6 +320,31 @@ def _run_single_category(
         recon_batches.append(recons)
 
     infer_time_s = time.perf_counter() - t_infer
+
+    wta_diagnostics: dict[str, float] | None = None
+    if has_wta:
+        wta_stats: dict[str, float] = model.net.wta.get_density_stats()
+        wta_diagnostics = wta_stats
+        eval_active = wta_stats["eval_active_density"]
+        print(
+            f"[WTA Test Density] eval_active={eval_active:.4f} "
+            f"(thresh_mean={wta_stats['threshold_mean']:.4f}, "
+            f"thresh_max={wta_stats['threshold_max']:.4f})"
+        )
+        if not math.isnan(eval_active):
+            if eval_active < 0.005:
+                print(
+                    f"[WARN] WTA bottleneck active density is very low "
+                    f"({eval_active:.4f} < 0.005); "
+                    "possible bottleneck collapse. Consider lowering --wta-eval-scale or "
+                    "increasing --wta-lifetime-sparsity."
+                )
+            elif eval_active > 0.50:
+                print(
+                    f"[WARN] WTA bottleneck active density is high ({eval_active:.4f} > 0.50); "
+                    "sparsity constraint is weak. Consider increasing --wta-eval-scale or "
+                    "lowering --wta-lifetime-sparsity."
+                )
 
     image_scores = np.concatenate(score_batches, axis=0)
     anomaly_maps = np.concatenate(map_batches, axis=0)
@@ -357,6 +388,8 @@ def _run_single_category(
         "epoch_losses": epoch_losses,
         "metrics": metrics,
     }
+    if wta_diagnostics is not None:
+        results_payload["wta_diagnostics"] = wta_diagnostics
 
     metrics_path = output_dir / "metrics.json"
     with metrics_path.open("w", encoding="utf-8") as f:

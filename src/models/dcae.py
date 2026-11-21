@@ -13,7 +13,6 @@ import numpy as np
 import torch
 
 from src.config import AutoencoderConfig
-from src.dataset import iter_batches
 
 _MAX_GPU_STAGE_BYTES = 8 * 1024**3
 
@@ -95,17 +94,25 @@ def _iter_msgms_error_scales(
     """Return weighted (weight, error_map) pairs combining SSIM and GMS at 1x, 0.5x, 0.25x."""
     h, w = x.shape[-2], x.shape[-1]
     maps: list[tuple[float, torch.Tensor]] = []
-    for scale, weight in ((1, 0.15), (2, 0.45), (4, 0.40)):
+    for scale, weight, win in ((1, 0.35, 11), (2, 0.40, 7), (4, 0.25, 5)):
         if min(h, w) < scale:
             continue
         if scale == 1:
-            xh_s, x_s = x_hat, x
+            xh_s, x_s = x_hat, x  # Shape: (B, C, H, W)
         else:
-            xh_s = torch.nn.functional.avg_pool2d(x_hat.float(), kernel_size=scale)
-            x_s = torch.nn.functional.avg_pool2d(x.float(), kernel_size=scale)
-        ssim_err = (1.0 - _ssim_map(xh_s, x_s)).mean(dim=1, keepdim=True)
-        gms_err = (1.0 - _gms_map(xh_s, x_s)).mean(dim=1, keepdim=True)
-        scale_err = 0.5 * ssim_err + 0.5 * gms_err
+            xh_s = torch.nn.functional.avg_pool2d(
+                x_hat.float(), kernel_size=scale
+            )  # Shape: (B, C, H//scale, W//scale)
+            x_s = torch.nn.functional.avg_pool2d(
+                x.float(), kernel_size=scale
+            )  # Shape: (B, C, H//scale, W//scale)
+        ssim_err = (1.0 - _ssim_map(xh_s, x_s, window_size=win)).mean(
+            dim=1, keepdim=True
+        )  # Shape: (B, 1, H_s, W_s)
+        gms_err = (1.0 - _gms_map(xh_s, x_s, window_size=win)).mean(
+            dim=1, keepdim=True
+        )  # Shape: (B, 1, H_s, W_s)
+        scale_err = 0.5 * ssim_err + 0.5 * gms_err  # Shape: (B, 1, H_s, W_s)
         maps.append((weight, scale_err))
     return maps
 
@@ -131,31 +138,48 @@ def _ms_l1_ssim_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return 0.2 * l1 + 0.8 * struct_err
 
 
+def _cosine_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Compute channel-dimension-invariant cosine distance loss in [0, 2]."""
+    # Shape: x_hat and x are (B, C, H, W)
+    cos = torch.nn.functional.cosine_similarity(
+        x_hat.float(), x.float(), dim=1, eps=1e-6
+    )  # Shape: (B, H, W)
+    return (1.0 - cos).mean()  # Shape: ()
+
+
 _LOSS_FUNCTIONS = {
     "l1": torch.nn.functional.l1_loss,
     "l2": torch.nn.functional.mse_loss,
     "smooth_l1": torch.nn.functional.smooth_l1_loss,
     "l1_ssim": _l1_ssim_loss,
     "ms_l1_ssim": _ms_l1_ssim_loss,
+    "cosine": _cosine_loss,
 }
 
 
 def _compute_raw_error_map(x_hat: torch.Tensor, x: torch.Tensor, loss_type: str) -> torch.Tensor:
     """Compute per-pixel (B, 1, H, W) reconstruction error map in float32."""
-    x_hat_f32 = x_hat.float()
-    x_f32 = x.float()
+    x_hat_f32 = x_hat.float()  # Shape: (B, C, H, W)
+    x_f32 = x.float()  # Shape: (B, C, H, W)
     if loss_type == "l1":
-        return (x_f32 - x_hat_f32).abs().mean(dim=1, keepdim=True)
+        return (x_f32 - x_hat_f32).abs().mean(dim=1, keepdim=True)  # Shape: (B, 1, H, W)
     if loss_type == "smooth_l1":
         return torch.nn.functional.smooth_l1_loss(
             x_hat_f32, x_f32, reduction="none"
-        ).mean(dim=1, keepdim=True)
+        ).mean(dim=1, keepdim=True)  # Shape: (B, 1, H, W)
+    if loss_type == "cosine":
+        cos = torch.nn.functional.cosine_similarity(
+            x_hat_f32, x_f32, dim=1, eps=1e-6
+        )  # Shape: (B, H, W)
+        return (1.0 - cos).unsqueeze(1)  # Shape: (B, 1, H, W)
     if loss_type == "l1_ssim":
-        l1_map = (x_f32 - x_hat_f32).abs().mean(dim=1, keepdim=True)
-        ssim_err_map = (1.0 - _ssim_map(x_hat_f32, x_f32)).mean(dim=1, keepdim=True)
-        return 0.2 * l1_map + 0.8 * ssim_err_map
+        l1_map = (x_f32 - x_hat_f32).abs().mean(dim=1, keepdim=True)  # Shape: (B, 1, H, W)
+        ssim_err_map = (1.0 - _ssim_map(x_hat_f32, x_f32)).mean(
+            dim=1, keepdim=True
+        )  # Shape: (B, 1, H, W)
+        return 0.2 * l1_map + 0.8 * ssim_err_map  # Shape: (B, 1, H, W)
     if loss_type == "ms_l1_ssim":
-        l1_map = (x_f32 - x_hat_f32).abs().mean(dim=1, keepdim=True)
+        l1_map = (x_f32 - x_hat_f32).abs().mean(dim=1, keepdim=True)  # Shape: (B, 1, H, W)
         target_hw = (x_f32.shape[-2], x_f32.shape[-1])
         weighted_scales = _iter_msgms_error_scales(x_hat_f32, x_f32)
         total_weight = sum(w for w, _ in weighted_scales)
@@ -170,9 +194,11 @@ def _compute_raw_error_map(x_hat: torch.Tensor, x: torch.Tensor, loss_type: str)
             )
             for w, s in weighted_scales
         ]
-        ssim_err_map = torch.stack(upsampled_scales, dim=0).sum(dim=0) / total_weight
-        return 0.2 * l1_map + 0.8 * ssim_err_map
-    return ((x_f32 - x_hat_f32) ** 2).mean(dim=1, keepdim=True)
+        ssim_err_map = (
+            torch.stack(upsampled_scales, dim=0).sum(dim=0) / total_weight
+        )  # Shape: (B, 1, H, W)
+        return 0.2 * l1_map + 0.8 * ssim_err_map  # Shape: (B, 1, H, W)
+    return ((x_f32 - x_hat_f32) ** 2).mean(dim=1, keepdim=True)  # Shape: (B, 1, H, W)
 
 
 def _corrupt_batch(
@@ -452,6 +478,82 @@ def _morphological_open_2d(tensor: torch.Tensor, kernel_size: int = 3) -> torch.
     )
 
 
+def _guided_filter_2d(
+    guide_rgb: torch.Tensor,
+    src: torch.Tensor,
+    radius: int,
+    eps: float,
+) -> torch.Tensor:
+    """Apply Fast Guided Filter using guide_rgb luminance edges to sharpen anomaly map src."""
+    # Shape: guide_rgb is (B, C_g, H_g, W_g), src is (B, 1, H, W)
+    if radius <= 0:
+        return src  # Shape: (B, 1, H, W)
+
+    guide_f32 = guide_rgb.float()  # Shape: (B, C_g, H_g, W_g)
+    src_f32 = src.float()  # Shape: (B, 1, H, W)
+    if guide_f32.shape[1] == 3:
+        r = guide_f32[:, 0:1, :, :]  # Shape: (B, 1, H_g, W_g)
+        g = guide_f32[:, 1:2, :, :]  # Shape: (B, 1, H_g, W_g)
+        b_ch = guide_f32[:, 2:3, :, :]  # Shape: (B, 1, H_g, W_g)
+        guide = 0.299 * r + 0.587 * g + 0.114 * b_ch  # Shape: (B, 1, H_g, W_g)
+    else:
+        guide = guide_f32.mean(dim=1, keepdim=True)  # Shape: (B, 1, H_g, W_g)
+
+    h, w = src_f32.shape[-2], src_f32.shape[-1]
+    if guide.shape[-2:] != (h, w):
+        guide = torch.nn.functional.interpolate(
+            guide, size=(h, w), mode="bilinear", align_corners=False
+        )  # Shape: (B, 1, H, W)
+
+    subsample = 2 if (min(h, w) >= 512 and radius >= 4) else 1
+    r_eff = max(1, radius // subsample)
+    win = 2 * r_eff + 1
+
+    if subsample > 1:
+        g_s = torch.nn.functional.interpolate(
+            guide, scale_factor=1.0 / subsample, mode="bilinear", align_corners=False
+        )  # Shape: (B, 1, H_s, W_s)
+        p_s = torch.nn.functional.interpolate(
+            src_f32, scale_factor=1.0 / subsample, mode="bilinear", align_corners=False
+        )  # Shape: (B, 1, H_s, W_s)
+    else:
+        g_s = guide  # Shape: (B, 1, H, W)
+        p_s = src_f32  # Shape: (B, 1, H, W)
+
+    mean_g = _separable_avg_pool2d(g_s, window_size=win)  # Shape: (B, 1, H_s, W_s)
+    mean_p = _separable_avg_pool2d(p_s, window_size=win)  # Shape: (B, 1, H_s, W_s)
+    corr_g = _separable_avg_pool2d(g_s * g_s, window_size=win)  # Shape: (B, 1, H_s, W_s)
+    corr_gp = _separable_avg_pool2d(g_s * p_s, window_size=win)  # Shape: (B, 1, H_s, W_s)
+
+    var_g = (corr_g - mean_g * mean_g).clamp(min=0.0)  # Shape: (B, 1, H_s, W_s)
+    cov_gp = corr_gp - mean_g * mean_p  # Shape: (B, 1, H_s, W_s)
+
+    a = cov_gp / (var_g + eps)  # Shape: (B, 1, H_s, W_s)
+    b = mean_p - a * mean_g  # Shape: (B, 1, H_s, W_s)
+
+    mean_a = _separable_avg_pool2d(a, window_size=win)  # Shape: (B, 1, H_s, W_s)
+    mean_b = _separable_avg_pool2d(b, window_size=win)  # Shape: (B, 1, H_s, W_s)
+
+    if subsample > 1:
+        mean_a = torch.nn.functional.interpolate(
+            mean_a, size=(h, w), mode="bilinear", align_corners=False
+        )  # Shape: (B, 1, H, W)
+        mean_b = torch.nn.functional.interpolate(
+            mean_b, size=(h, w), mode="bilinear", align_corners=False
+        )  # Shape: (B, 1, H, W)
+
+    return (mean_a * guide + mean_b).clamp(min=0.0)  # Shape: (B, 1, H, W)
+
+
+def _uint8_nhwc_to_unit_nchw(batch_images: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Convert uint8 (B, H, W, C) numpy array to float32 (B, C, H, W) in [0.0, 1.0]."""
+    contiguous = np.ascontiguousarray(batch_images)  # Shape: (B, H, W, C)
+    tensor_u8 = torch.from_numpy(contiguous).to(
+        device=device, non_blocking=True
+    )  # Shape: (B, H, W, C)
+    return tensor_u8.permute(0, 3, 1, 2).to(dtype=torch.float32).div_(255.0)  # Shape: (B, C, H, W)
+
+
 class RawAutoencoderModel:
     """Training, inference, and anomaly-map scoring wrapper around ConvAutoencoder."""
 
@@ -517,12 +619,59 @@ class RawAutoencoderModel:
             "num_stages": self.config.num_stages,
         }
 
+    def _on_epoch_start(self, epoch: int) -> None:
+        """Optional hook called at the start of each training epoch."""
+        _ = epoch
+
+    def _maybe_cache_train_features(
+        self,
+        train_images: np.ndarray,
+        extractor: Any,
+    ) -> torch.Tensor | None:
+        """Pre-extract frozen extractor feature maps once before the training epoch loop."""
+        if not getattr(extractor, "cache_features_for_training", False) or len(train_images) == 0:
+            return None
+
+        cache_dtype = torch.bfloat16 if self._use_amp else torch.float32
+        chunks: list[torch.Tensor] = []
+        num_samples = len(train_images)
+        with torch.inference_mode():
+            for start in range(0, num_samples, self.batch_size):
+                batch_np = np.ascontiguousarray(
+                    train_images[start : start + self.batch_size]
+                )  # Shape: (B, H, W, C)
+                feats = extractor.extract_batch(batch_np)  # Shape: (B, C_f, H_p, W_p)
+                chunks.append(
+                    feats.to(device="cpu", dtype=cache_dtype)
+                )  # Shape: (B, C_f, H_p, W_p)
+
+        cached = torch.cat(chunks, dim=0).contiguous()  # Shape: (N, C_f, H_p, W_p)
+        if self.device.type == "cuda":
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(self.device)
+                max_stage_bytes = min(_MAX_GPU_STAGE_BYTES, int(free_bytes * 0.5))
+                if cached.nbytes < max_stage_bytes:
+                    cached = cached.to(
+                        device=self.device, memory_format=torch.channels_last
+                    )  # Shape: (N, C_f, H_p, W_p)
+            except RuntimeError:
+                pass
+
+        print(
+            f"[Cache] Pre-extracted {num_samples} feature maps of shape {tuple(cached.shape)} "
+            f"({cached.nbytes / 1e6:.1f} MB) on {cached.device}",
+            flush=True,
+        )
+        return cached
+
     def _maybe_preload_train_gpu(
         self,
         train_images: np.ndarray,
         extractor: Any,
     ) -> torch.Tensor | None:
         """Cache uint8 training images in VRAM when CUDA is active and memory permits."""
+        if getattr(extractor, "cache_features_for_training", False):
+            return None
         if self.device.type != "cuda" or not hasattr(extractor, "normalize_uint8_tensor"):
             return None
         try:
@@ -537,7 +686,7 @@ class RawAutoencoderModel:
             .to(device=self.device)
             .permute(0, 3, 1, 2)
             .contiguous(memory_format=torch.channels_last)
-        )
+        )  # Shape: (N, C, H, W)
 
     def _iter_train_batches(
         self,
@@ -546,55 +695,73 @@ class RawAutoencoderModel:
         train_gpu_u8: torch.Tensor | None,
         epoch: int,
         shuffle: bool = True,
-    ) -> Iterator[torch.Tensor]:
-        """Yield (B, C, H, W) float32 batches from GPU cache or CPU."""
-        if train_gpu_u8 is not None:
-            num_samples = train_gpu_u8.shape[0]
-            order = (
-                torch.randperm(
-                    num_samples,
-                    device=self.device,
-                    generator=torch.Generator(device=self.device).manual_seed(self.seed + epoch),
-                )
-                if shuffle
-                else None
-            )
+        cached_features: torch.Tensor | None = None,
+    ) -> Iterator[tuple[np.ndarray, torch.Tensor]]:
+        """Yield (indices, (B, C, H, W) float32 batch) from feature cache, GPU uint8, or CPU."""
+        num_samples = len(train_images)
+        indices = (
+            np.random.default_rng(self.seed + epoch).permutation(num_samples)
+            if shuffle
+            else np.arange(num_samples)
+        )
+
+        if cached_features is not None:
+            mem_fmt = torch.channels_last if self.device.type == "cuda" else torch.contiguous_format
             for start in range(0, num_samples, self.batch_size):
-                batch_u8 = (
-                    train_gpu_u8[order[start : start + self.batch_size]]
-                    if order is not None
-                    else train_gpu_u8[start : start + self.batch_size]
-                )
-                yield extractor.normalize_uint8_tensor(batch_u8)
+                idx_slice = indices[start : start + self.batch_size]
+                idx_t = torch.from_numpy(idx_slice).to(device=cached_features.device)
+                batch_feat = cached_features[idx_t]  # Shape: (B, C_f, H_p, W_p)
+                x = batch_feat.to(
+                    device=self.device,
+                    dtype=torch.float32,
+                    memory_format=mem_fmt,
+                    non_blocking=True,
+                )  # Shape: (B, C_f, H_p, W_p)
+                yield idx_slice, x
             return
 
-        for batch_np in iter_batches(
-            train_images,
-            batch_size=self.batch_size,
-            shuffle=shuffle,
-            seed=self.seed + epoch,
-        ):
-            yield extractor.extract_batch(batch_np)
+        if train_gpu_u8 is not None:
+            for start in range(0, num_samples, self.batch_size):
+                idx_slice = indices[start : start + self.batch_size]
+                idx_t = torch.from_numpy(idx_slice).to(device=self.device)
+                batch_u8 = train_gpu_u8[idx_t]  # Shape: (B, C, H, W)
+                yield idx_slice, extractor.normalize_uint8_tensor(batch_u8)
+            return
+
+        for start in range(0, num_samples, self.batch_size):
+            idx_slice = indices[start : start + self.batch_size]
+            batch_np = np.ascontiguousarray(train_images[idx_slice])  # Shape: (B, H, W, C)
+            yield idx_slice, extractor.extract_batch(batch_np)
 
     def _score_batch_tensor(
         self,
         x: torch.Tensor,
         target_hw: tuple[int, int] | None,
         apply_calibration: bool = True,
+        guide_rgb: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute reconstruction (float32) and damped/calibrated error map (B, 1, H, W)."""
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self._use_amp):
-            x_hat = self.net(x)
-        x_hat_f32 = x_hat.float()
+            x_hat = self.net(x)  # Shape: (B, C, H_in, W_in)
+        x_hat_f32 = x_hat.float()  # Shape: (B, C, H_in, W_in)
 
-        err_map = _compute_raw_error_map(x_hat_f32, x, self.config.loss_type)
+        err_map = _compute_raw_error_map(
+            x_hat_f32, x, self.config.loss_type
+        )  # Shape: (B, 1, H_in, W_in)
 
-        if self.config.texture_damping > 0.0:
-            mu_hat = _separable_avg_pool2d(x_hat_f32, window_size=11)
-            sq_hat = _separable_avg_pool2d(x_hat_f32 * x_hat_f32, window_size=11)
-            var_hat = (sq_hat - mu_hat * mu_hat).clamp(min=0.0)
-            texture_std = torch.sqrt(var_hat.mean(dim=1, keepdim=True).clamp(min=0.0))
-            err_map = err_map / (1.0 + self.config.texture_damping * texture_std)
+        # Apply texture variance damping only in [0, 1] pixel space (not ViT patch grids)
+        if self.use_sigmoid and self.config.texture_damping > 0.0:
+            mu_hat = _separable_avg_pool2d(x_hat_f32, window_size=11)  # Shape: (B, C, H_in, W_in)
+            sq_hat = _separable_avg_pool2d(
+                x_hat_f32 * x_hat_f32, window_size=11
+            )  # Shape: (B, C, H_in, W_in)
+            var_hat = (sq_hat - mu_hat * mu_hat).clamp(min=0.0)  # Shape: (B, C, H_in, W_in)
+            texture_std = torch.sqrt(
+                var_hat.mean(dim=1, keepdim=True).clamp(min=0.0)
+            )  # Shape: (B, 1, H_in, W_in)
+            err_map = err_map / (
+                1.0 + self.config.texture_damping * texture_std
+            )  # Shape: (B, 1, H_in, W_in)
 
         if target_hw is not None and err_map.shape[-2:] != target_hw:
             err_map = torch.nn.functional.interpolate(
@@ -602,12 +769,22 @@ class RawAutoencoderModel:
                 size=target_hw,
                 mode="bilinear",
                 align_corners=False,
-            )
+            )  # Shape: (B, 1, H_out, W_out)
 
         if min(err_map.shape[-2], err_map.shape[-1]) >= 32:
-            err_map = _morphological_open_2d(err_map, kernel_size=3)
+            err_map = _morphological_open_2d(err_map, kernel_size=3)  # Shape: (B, 1, H_out, W_out)
 
-        err_map = _gaussian_blur_2d(err_map, self.config.gaussian_sigma)
+        err_map = _gaussian_blur_2d(
+            err_map, self.config.gaussian_sigma
+        )  # Shape: (B, 1, H_out, W_out)
+
+        if self.config.guided_filter_radius > 0 and guide_rgb is not None:
+            err_map = _guided_filter_2d(
+                guide_rgb,
+                err_map,
+                radius=self.config.guided_filter_radius,
+                eps=self.config.guided_filter_eps,
+            )  # Shape: (B, 1, H_out, W_out)
 
         if apply_calibration and bool(self.net.calibrated.item()):
             mu_map = 0.5 * self.net.err_mean + 0.5 * torch.nn.functional.interpolate(
@@ -615,7 +792,7 @@ class RawAutoencoderModel:
                 size=err_map.shape[-2:],
                 mode="bilinear",
                 align_corners=False,
-            )
+            )  # Shape: (1, 1, H_out, W_out)
             std_map = (
                 0.5 * self.net.err_std
                 + 0.5
@@ -625,9 +802,11 @@ class RawAutoencoderModel:
                     mode="bilinear",
                     align_corners=False,
                 )
-            ).clamp(min=1e-4)
-            z_map = (err_map - mu_map) / std_map
-            err_map = torch.nn.functional.softplus(z_map - 1.5, beta=2.0)
+            ).clamp(min=1e-4)  # Shape: (1, 1, H_out, W_out)
+            z_map = (err_map - mu_map) / std_map  # Shape: (B, 1, H_out, W_out)
+            err_map = torch.nn.functional.softplus(
+                z_map - 1.5, beta=2.0
+            )  # Shape: (B, 1, H_out, W_out)
 
         return x_hat_f32, err_map
 
@@ -636,6 +815,7 @@ class RawAutoencoderModel:
         train_images: np.ndarray,
         extractor: Any,
         train_gpu_u8: torch.Tensor | None,
+        cached_features: torch.Tensor | None = None,
     ) -> None:
         """Estimate defect-free training pixel error baseline statistics in eval mode."""
         self.net.eval()
@@ -646,19 +826,51 @@ class RawAutoencoderModel:
         total_pixels = 0
         total_images = 0
 
+        ds_cfg = getattr(extractor, "dataset_cfg", None)
+        if ds_cfg is not None and hasattr(ds_cfg, "image_size"):
+            target_hw = (int(ds_cfg.image_size[0]), int(ds_cfg.image_size[1]))
+        else:
+            target_hw = (int(train_images.shape[1]), int(train_images.shape[2]))
+
         with torch.inference_mode():
-            for x in self._iter_train_batches(
-                train_images, extractor, train_gpu_u8, epoch=0, shuffle=False
+            for idx_slice, x in self._iter_train_batches(
+                train_images,
+                extractor,
+                train_gpu_u8,
+                epoch=0,
+                shuffle=False,
+                cached_features=cached_features,
             ):
-                _, err_map = self._score_batch_tensor(x, target_hw=None, apply_calibration=False)
-                err_f64 = err_map.to(torch.float64)
+                guide_rgb: torch.Tensor | None = None
+                if self.config.guided_filter_radius > 0:
+                    if self.use_sigmoid and cached_features is None and x.shape[-2:] == target_hw:
+                        guide_rgb = x  # Shape: (B, C, H, W)
+                    elif train_gpu_u8 is not None:
+                        idx_t = torch.from_numpy(idx_slice).to(device=train_gpu_u8.device)
+                        guide_rgb = (
+                            train_gpu_u8[idx_t]
+                            .to(device=self.device, dtype=torch.float32)
+                            .div_(255.0)
+                        )  # Shape: (B, C_img, H, W)
+                    else:
+                        guide_rgb = _uint8_nhwc_to_unit_nchw(
+                            train_images[idx_slice], self.device
+                        )  # Shape: (B, C_img, H, W)
+
+                _, err_map = self._score_batch_tensor(
+                    x,
+                    target_hw=target_hw,
+                    apply_calibration=False,
+                    guide_rgb=guide_rgb,
+                )  # Shape: (B, 1, H_t, W_t)
+                err_f64 = err_map.to(torch.float64)  # Shape: (B, 1, H_t, W_t)
                 sum_err += err_f64.sum()
                 sum_err_sq += (err_f64 * err_f64).sum()
                 total_pixels += err_map.numel()
 
                 pooled = torch.nn.functional.adaptive_avg_pool2d(err_map, (16, 16)).to(
                     torch.float64
-                )
+                )  # Shape: (B, 1, 16, 16)
                 spatial_sum += pooled.sum(dim=0, keepdim=True)
                 spatial_sum_sq += (pooled * pooled).sum(dim=0, keepdim=True)
                 total_images += x.shape[0]
@@ -690,6 +902,19 @@ class RawAutoencoderModel:
 
     def fit(self, train_images: np.ndarray, extractor: Any) -> list[float]:
         """Train the autoencoder on normal images and return per-epoch average losses."""
+        if (
+            not self.use_sigmoid
+            and self.config.loss_type == "l2"
+            and self.config.loss_floor > 0.0
+            and self.config.loss_floor >= (1.0 / max(1, self.in_channels))
+        ):
+            print(
+                f"[WARN] loss_floor={self.config.loss_floor:.6f} >= 1/C "
+                f"({1.0 / max(1, self.in_channels):.6f}) with feature-space 'l2' loss; "
+                "early stopping may trigger at epoch 21. Consider --loss cosine or --loss-floor 0.",
+                flush=True,
+            )
+
         optimizer = torch.optim.AdamW(
             self.net.parameters(),
             lr=self.config.lr,
@@ -703,17 +928,28 @@ class RawAutoencoderModel:
         num_samples = len(train_images)
         epoch_losses: list[float] = []
         consecutive_floor_hits = 0
-        train_gpu_u8 = self._maybe_preload_train_gpu(train_images, extractor)
+        cached_features = self._maybe_cache_train_features(train_images, extractor)
+        train_gpu_u8 = (
+            None
+            if cached_features is not None
+            else self._maybe_preload_train_gpu(train_images, extractor)
+        )
 
         try:
             for epoch in range(1, self.config.epochs + 1):
+                self._on_epoch_start(epoch)
                 self.net.train()
                 t0 = time.perf_counter()
                 running_loss = torch.zeros((), dtype=torch.float64, device=self.device)
 
-                for step_idx, x in enumerate(
+                for step_idx, (_idx_slice, x) in enumerate(
                     self._iter_train_batches(
-                        train_images, extractor, train_gpu_u8, epoch, shuffle=True
+                        train_images,
+                        extractor,
+                        train_gpu_u8,
+                        epoch,
+                        shuffle=True,
+                        cached_features=cached_features,
                     )
                 ):
                     optimizer.zero_grad(set_to_none=True)
@@ -725,10 +961,10 @@ class RawAutoencoderModel:
                         )
                         if self.config.denoise_prob > 0.0
                         else x
-                    )
+                    )  # Shape: (B, C, H_in, W_in)
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self._use_amp):
-                        x_hat = self.net(x_in)
-                        loss = self._loss_fn(x_hat, x)
+                        x_hat = self.net(x_in)  # Shape: (B, C, H_in, W_in)
+                        loss = self._loss_fn(x_hat, x)  # Shape: ()
                     loss.backward()
                     optimizer.step()
                     running_loss += loss.detach().to(torch.float64) * x.shape[0]
@@ -756,9 +992,14 @@ class RawAutoencoderModel:
                     else:
                         consecutive_floor_hits = 0
 
-            self._calibrate_normal_baseline(train_images, extractor, train_gpu_u8)
+            self._calibrate_normal_baseline(
+                train_images,
+                extractor,
+                train_gpu_u8,
+                cached_features=cached_features,
+            )
         finally:
-            del train_gpu_u8
+            del train_gpu_u8, cached_features
 
         return epoch_losses
 
@@ -771,17 +1012,29 @@ class RawAutoencoderModel:
         """Run inference on one batch and return (image_scores, anomaly_maps, recons_uint8)."""
         self.net.eval()
         with torch.inference_mode():
-            x = extractor.extract_batch(batch_images)
+            x = extractor.extract_batch(batch_images)  # Shape: (B, C_in, H_in, W_in)
+            guide_rgb: torch.Tensor | None = None
+            if self.config.guided_filter_radius > 0:
+                if self.use_sigmoid and x.shape[-2:] == target_hw:
+                    guide_rgb = x  # Shape: (B, C, H_t, W_t)
+                else:
+                    guide_rgb = _uint8_nhwc_to_unit_nchw(
+                        batch_images, self.device
+                    )  # Shape: (B, C_img, H, W)
             x_hat, err_map = self._score_batch_tensor(
-                x, target_hw=target_hw, apply_calibration=True
-            )
+                x, target_hw=target_hw, apply_calibration=True, guide_rgb=guide_rgb
+            )  # Shape: (B, C_in, H_in, W_in), (B, 1, H_t, W_t)
 
-            score_map = torch.nn.functional.avg_pool2d(err_map, kernel_size=3, stride=1, padding=1)
-            flat = score_map.flatten(start_dim=1)
+            score_map = torch.nn.functional.avg_pool2d(
+                err_map, kernel_size=3, stride=1, padding=1
+            )  # Shape: (B, 1, H_t, W_t)
+            flat = score_map.flatten(start_dim=1)  # Shape: (B, H_t * W_t)
             k = max(1, math.ceil(flat.shape[1] * self.config.score_top_k_pct))
-            top_vals = torch.topk(flat, k=k, dim=1).values
+            top_vals = torch.topk(flat, k=k, dim=1).values  # Shape: (B, k)
             k_core = max(1, math.ceil(k * 0.1))
-            image_scores = 0.5 * top_vals[:, :k_core].mean(dim=1) + 0.5 * top_vals.mean(dim=1)
+            image_scores = (
+                0.5 * top_vals[:, :k_core].mean(dim=1) + 0.5 * top_vals.mean(dim=1)
+            )  # Shape: (B,)
 
             if hasattr(extractor, "to_uint8_images"):
                 recons_uint8 = extractor.to_uint8_images(x_hat)

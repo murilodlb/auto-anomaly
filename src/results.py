@@ -22,7 +22,8 @@ _NAME_HP_PATTERN = re.compile(
     r"^(?P<prefix>.+?)_"
     r"(?:(?P<model>wta_ae|dcae)_)?"
     r"(?:(?P<res>fullres|\d+x\d+)_)?"
-    r"(?P<loss>ms_l1_ssim|l1_ssim|l1ssim|smooth_l1|l1|l2)_"
+    r"(?:(?P<extractor>dinov3|raw)_)?"
+    r"(?P<loss>ms_l1_ssim|l1_ssim|l1ssim|smooth_l1|cosine|l1|l2)_"
     r"s(?P<stages>\d+)"
     r"(?:_c(?P<base_ch>\d+))?"
     r"(?:_z(?P<latent>\d+))?"
@@ -59,6 +60,7 @@ class ExperimentRecord:
     parent_experiment: str
     category: str
     model: str
+    extractor: str
     status: str
     updated_at: str
     device: str
@@ -82,6 +84,8 @@ class ExperimentRecord:
     loss_floor: float | None
     wta_spatial_window: int | None
     wta_lifetime_sparsity: float | None
+    wta_train_density: float | None
+    wta_eval_density: float | None
     full_res: bool | None
     use_amp: bool | None
     pro_integration_limit: float
@@ -148,6 +152,11 @@ def _safe_float(val: Any, default: float = _NAN) -> float:
         return out
     except (TypeError, ValueError):
         return default
+
+
+def _safe_opt_float(val: Any) -> float | None:
+    out = _safe_float(val)
+    return None if math.isnan(out) else out
 
 
 def _safe_int(val: Any) -> int | None:
@@ -223,6 +232,8 @@ def parse_experiment_name_hyperparams(name: str) -> dict[str, Any]:
     }
     if match.group("model") is not None:
         parsed["model"] = match.group("model")
+    if match.group("extractor") is not None:
+        parsed["extractor"] = match.group("extractor")
     if res_raw == "fullres":
         parsed["full_res"] = True
     if match.group("base_ch") is not None:
@@ -377,6 +388,21 @@ def _resolve_hyperparams(
     return hp_source, merged
 
 
+def _resolve_extractor(
+    payload: dict[str, Any],
+    hp: dict[str, Any],
+    parsed_name: dict[str, Any],
+    name_candidates: Sequence[str],
+) -> str:
+    raw_ext = payload.get("extractor") or hp.get("extractor") or parsed_name.get("extractor")
+    if isinstance(raw_ext, str) and raw_ext.strip():
+        return raw_ext.strip()
+    for candidate in name_candidates:
+        if candidate and "dinov3" in candidate.lower():
+            return "dinov3"
+    return "raw"
+
+
 def _build_record_from_run_dir(
     run_dir: Path,
     experiment_name: str,
@@ -445,12 +471,19 @@ def _build_record_from_run_dir(
         experiment_name
     ) or parse_experiment_name_hyperparams(parent_experiment)
     model_name = str(hp.get("model") or parsed_name.get("model") or payload.get("model") or "")
+    extractor_name = _resolve_extractor(
+        payload, hp, parsed_name, [experiment_name, parent_experiment]
+    )
+    wta_diag = payload.get("wta_diagnostics", {})
+    if not isinstance(wta_diag, dict):
+        wta_diag = {}
 
     rec = ExperimentRecord(
         experiment_name=experiment_name,
         parent_experiment=parent_experiment,
         category=category,
         model=model_name,
+        extractor=extractor_name,
         status="complete",
         updated_at=_format_timestamp(latest_mtime),
         device=str(payload.get("device", "")),
@@ -486,6 +519,8 @@ def _build_record_from_run_dir(
             if "wta_lifetime_sparsity" in hp
             else None
         ),
+        wta_train_density=_safe_opt_float(wta_diag.get("train_active_density")),
+        wta_eval_density=_safe_opt_float(wta_diag.get("eval_active_density")),
         full_res=_safe_bool(hp.get("full_res")),
         use_amp=_safe_bool(hp.get("use_amp")),
         pro_integration_limit=_safe_float(
@@ -557,11 +592,13 @@ def _build_record_from_run_dir(
 def _build_incomplete_record(inv: FolderInventoryEntry) -> ExperimentRecord:
     parsed = parse_experiment_name_hyperparams(inv.folder_name)
     inferred_cat = inv.folder_name.split("_", 1)[0] if "_" in inv.folder_name else ""
+    extractor_name = _resolve_extractor({}, parsed, parsed, [inv.folder_name])
     return ExperimentRecord(
         experiment_name=inv.folder_name,
         parent_experiment="",
         category=inferred_cat,
         model=str(parsed.get("model", "")),
+        extractor=extractor_name,
         status=inv.status,
         updated_at=inv.updated_at,
         device="",
@@ -585,6 +622,8 @@ def _build_incomplete_record(inv: FolderInventoryEntry) -> ExperimentRecord:
         loss_floor=None,
         wta_spatial_window=None,
         wta_lifetime_sparsity=None,
+        wta_train_density=None,
+        wta_eval_density=None,
         full_res=_safe_bool(parsed.get("full_res")),
         use_amp=None,
         pro_integration_limit=0.3,
@@ -822,7 +861,7 @@ def format_leaderboard_table(records: list[ExperimentRecord], top: int | None = 
 
     name_w = max(26, min(42, max(len(r.experiment_name) for r in shown) + 2))
     header = (
-        f"{'Experiment':<{name_w}} {'Category':<10} {'Model':<11} {'Loss':<10} "
+        f"{'Experiment':<{name_w}} {'Category':<10} {'Model':<11} {'Ext':<7} {'Loss':<10} "
         f"{'S':>2} {'C':>3} {'Z':>3} {'Ep':>3} {'Dmp':>4} {'Dns':>4} {'AU-PRO':>7} "
         f"{'ROC(max)':>8} {'ROC(k%)':>7} {'PixROC':>7} {'PixAP':>6} {'GoodMu':>7} "
         f"{'DefMu':>7} {'s/ep':>6}"
@@ -837,9 +876,10 @@ def format_leaderboard_table(records: list[ExperimentRecord], top: int | None = 
         )
         cat = r.category or "-"
         mdl = (r.model or "-")[:11]
+        ext = (r.extractor or "-")[:7]
         loss = r.loss_type or "-"
         lines.append(
-            f"{name:<{name_w}} {cat:<10} {mdl:<11} {loss:<10} "
+            f"{name:<{name_w}} {cat:<10} {mdl:<11} {ext:<7} {loss:<10} "
             f"{_fmt_opt_int(r.num_stages, 2)} {_fmt_opt_int(r.base_channels, 3)} "
             f"{_fmt_opt_int(r.latent_dim, 3)} {_fmt_opt_int(r.epochs, 3)} "
             f"{_fmt_opt_flt(r.texture_damping, 4)} {_fmt_opt_flt(r.denoise_prob, 4)} "

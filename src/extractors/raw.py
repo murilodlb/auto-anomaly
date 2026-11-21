@@ -48,6 +48,11 @@ class RawPixelExtractor:
         """Whether extracted tensors lie in [0.0, 1.0]."""
         return self._mean is None and self._std is None
 
+    @property
+    def cache_features_for_training(self) -> bool:
+        """Raw pixels are inexpensive to normalize on the fly."""
+        return False
+
     def normalize_uint8_tensor(self, tensor_nchw_u8: torch.Tensor) -> torch.Tensor:
         """Normalize an on-device (B, C, H, W) uint8 tensor into float32 (channels_last on CUDA)."""
         mem_fmt = torch.channels_last if self.device.type == "cuda" else torch.contiguous_format

@@ -314,6 +314,11 @@ class DINOv3Extractor:
         """L2-normalized patch embeddings span [-1, 1], not [0, 1]."""
         return False
 
+    @property
+    def cache_features_for_training(self) -> bool:
+        """Frozen DINOv3 features are deterministic and should be cached once per fit()."""
+        return True
+
     def normalize_uint8_tensor(self, tensor_nchw_u8: torch.Tensor) -> torch.Tensor:
         """Extract (B, C, H_p, W_p) float32 DINOv3 features from (B, 3, H, W) uint8 RGB."""
         model, _ = self._components

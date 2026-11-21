@@ -38,14 +38,16 @@ from src.models.dcae import (
     RawAutoencoderModel,
     _compute_raw_error_map,
     _corrupt_batch,
+    _cosine_loss,
     _gms_map,
+    _guided_filter_2d,
     _iter_msgms_error_scales,
     _morphological_open_2d,
     _ms_l1_ssim_loss,
     _ssim_map,
 )
 from src.models.wta_ae import WTAAutoencoderModel, WTAConvAutoencoder, WTASparsity2d
-from src.results import inspect_results_folders, scan_results
+from src.results import format_leaderboard_table, inspect_results_folders, scan_results
 from src.results import main as results_main
 from src.run import run_pipeline
 
@@ -450,7 +452,7 @@ def test_gms_map_finite_and_sensitive_to_thin_lines() -> None:
 
     # Multi-scale MSGMS weights and shapes
     scales = _iter_msgms_error_scales(recon, orig)
-    assert [w for w, _ in scales] == pytest.approx([0.15, 0.45, 0.40])
+    assert [w for w, _ in scales] == pytest.approx([0.35, 0.40, 0.25])
     assert [tuple(m.shape[-2:]) for _, m in scales] == [(64, 64), (32, 32), (16, 16)]
     assert all(torch.isfinite(m).all() for _, m in scales)
 
@@ -1218,3 +1220,323 @@ def test_wta_ae_pipeline_checkpoint_and_dcae_alias(tmp_path: Path) -> None:
     alias_cfg.validate()
     alias_model = get_model(alias_cfg, in_channels=3, device=torch.device("cpu"))
     assert type(alias_model) is RawAutoencoderModel
+
+
+def test_cosine_loss_error_map_and_feature_space_guards(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Identical tensors -> cosine distance 0.0
+    a = torch.tensor([[[[1.0, 0.0], [0.0, 3.0]], [[0.0, 2.0], [4.0, 0.0]]]])
+    assert float(_cosine_loss(a, a).item()) == pytest.approx(0.0, abs=1e-6)
+    err_same = _compute_raw_error_map(a, a, "cosine")
+    assert err_same.shape == (1, 1, 2, 2)
+    assert torch.allclose(err_same, torch.zeros_like(err_same), atol=1e-6)
+
+    # Orthogonal tensors -> cosine distance 1.0
+    orth_a = torch.tensor([[[[1.0]], [[0.0]]]])
+    orth_b = torch.tensor([[[[0.0]], [[1.0]]]])
+    assert float(_cosine_loss(orth_a, orth_b).item()) == pytest.approx(1.0, abs=1e-6)
+    assert float(_compute_raw_error_map(orth_a, orth_b, "cosine").item()) == pytest.approx(
+        1.0, abs=1e-6
+    )
+
+    # Opposite tensors -> cosine distance 2.0
+    assert float(_cosine_loss(orth_a, -orth_a).item()) == pytest.approx(2.0, abs=1e-6)
+
+    # bfloat16 finiteness including all-zero tensors
+    zeros_bf16 = torch.zeros((2, 16, 8, 8), dtype=torch.bfloat16)
+    rand_bf16 = torch.randn((2, 16, 8, 8), dtype=torch.bfloat16)
+    assert torch.isfinite(_cosine_loss(zeros_bf16, zeros_bf16))
+    assert torch.isfinite(_cosine_loss(rand_bf16, rand_bf16))
+    assert torch.isfinite(_compute_raw_error_map(zeros_bf16, rand_bf16, "cosine")).all()
+
+    # texture_damping must be ignored when use_sigmoid=False (feature space)
+    device = torch.device("cpu")
+    feat_x = torch.randn((2, 12, 16, 16), dtype=torch.float32)
+    cfg_damped = AutoencoderConfig(
+        latent_dim=8,
+        base_channels=8,
+        num_stages=2,
+        loss_type="cosine",
+        texture_damping=5.0,
+        gaussian_sigma=0.0,
+        guided_filter_radius=0,
+    )
+    cfg_undamped = AutoencoderConfig(
+        latent_dim=8,
+        base_channels=8,
+        num_stages=2,
+        loss_type="cosine",
+        texture_damping=0.0,
+        gaussian_sigma=0.0,
+        guided_filter_radius=0,
+    )
+    m_damped = RawAutoencoderModel(12, cfg_damped, device=device, use_sigmoid=False)
+    m_undamped = RawAutoencoderModel(12, cfg_undamped, device=device, use_sigmoid=False)
+    m_undamped.net.load_state_dict(m_damped.net.state_dict())
+    m_damped.net.eval()
+    m_undamped.net.eval()
+    with torch.inference_mode():
+        _, em_damped = m_damped._score_batch_tensor(feat_x, target_hw=None, apply_calibration=False)
+        _, em_undamped = m_undamped._score_batch_tensor(
+            feat_x, target_hw=None, apply_calibration=False
+        )
+    assert torch.allclose(em_damped, em_undamped, atol=1e-6)
+
+    # Guard warning when loss_floor >= 1/C for feature-space L2
+    rng = np.random.default_rng(7)
+    raw_u8 = rng.integers(0, 255, size=(2, 32, 32, 3), dtype=np.uint8)
+    ext = RawPixelExtractor(DatasetConfig(image_size=(32, 32)), RawExtractorConfig(), device)
+    warn_cfg = AutoencoderConfig(
+        latent_dim=8,
+        base_channels=8,
+        num_stages=2,
+        loss_type="l2",
+        epochs=1,
+        loss_floor=0.5,
+        guided_filter_radius=0,
+    )
+    warn_model = RawAutoencoderModel(64, warn_cfg, device=device, batch_size=2, use_sigmoid=False)
+    # Use a 64-channel dummy extractor that caches? Or direct fit with 3 channels and loss_floor=0.5
+    warn_model_3 = RawAutoencoderModel(3, warn_cfg, device=device, batch_size=2, use_sigmoid=False)
+    warn_model_3.fit(raw_u8, ext)
+    captured = capsys.readouterr().out
+    assert "loss_floor=" in captured and "1/C" in captured
+    _ = warn_model
+
+
+def test_guided_filter_edge_preservation_and_cli(tmp_path: Path) -> None:
+    # Step edge in guide image (left=0.0, right=1.0) paired with matching step in src + spike
+    guide = torch.zeros((1, 3, 64, 64), dtype=torch.float32)
+    guide[:, :, :, 32:] = 1.0
+    src = torch.zeros((1, 1, 64, 64), dtype=torch.float32)
+    src[:, :, :, 32:] = 1.0
+
+    # Zero radius is an exact identity no-op
+    assert torch.equal(_guided_filter_2d(guide, src, radius=0, eps=0.01), src)
+
+    # Guided filter preserves the step transition better than unconstrained box blur
+    filtered = _guided_filter_2d(guide, src, radius=4, eps=1e-3)
+    unconstrained = torch.nn.functional.avg_pool2d(src, kernel_size=9, stride=1, padding=4)
+    assert filtered.shape == src.shape
+    assert torch.isfinite(filtered).all()
+    leakage_gf = float(filtered[:, :, :, :32].max().item())
+    leakage_box = float(unconstrained[:, :, :, :32].max().item())
+    assert leakage_gf < leakage_box
+
+    # Grayscale + mismatched guide spatial resolution
+    gray_guide = torch.rand((2, 1, 32, 32), dtype=torch.float32)
+    src_up = torch.rand((2, 1, 64, 64), dtype=torch.float32)
+    out_gray = _guided_filter_2d(gray_guide, src_up, radius=4, eps=0.01)
+    assert out_gray.shape == (2, 1, 64, 64)
+    assert torch.isfinite(out_gray).all() and float(out_gray.min().item()) >= 0.0
+
+    # subsample=2 fast path triggered on >=512x512 inputs
+    big_guide = torch.rand((1, 3, 512, 512), dtype=torch.float32)
+    big_src = torch.rand((1, 1, 512, 512), dtype=torch.float32)
+    out_big = _guided_filter_2d(big_guide, big_src, radius=8, eps=0.01)
+    assert out_big.shape == (1, 1, 512, 512)
+    assert torch.isfinite(out_big).all()
+
+    # CLI flags and validation
+    data_root = _create_synthetic_mvtec(tmp_path)
+    args = build_parser().parse_args(
+        [
+            "--data-dir",
+            str(data_root),
+            "--loss",
+            "cosine",
+            "--guided-filter-radius",
+            "6",
+            "--guided-filter-eps",
+            "0.02",
+            "--device",
+            "cpu",
+        ]
+    )
+    cfg = PipelineConfig.from_args(**vars(args))
+    cfg.validate()
+    assert cfg.autoencoder.loss_type == "cosine"
+    assert cfg.autoencoder.guided_filter_radius == 6
+    assert cfg.autoencoder.guided_filter_eps == pytest.approx(0.02)
+
+    for bad_ae in (
+        AutoencoderConfig(guided_filter_radius=-1),
+        AutoencoderConfig(guided_filter_eps=0.0),
+    ):
+        with pytest.raises(ValueError):
+            PipelineConfig(
+                dataset=DatasetConfig(root_dir=data_root),
+                autoencoder=bad_ae,
+                device="cpu",
+            ).validate()
+
+
+def test_dinov3_feature_caching_and_fullres_calibration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    mock_proc = SimpleNamespace(image_mean=[0.485, 0.456, 0.406], image_std=[0.229, 0.224, 0.225])
+    forward_calls = {"samples": 0}
+
+    def _fake_load(self: DINOv3Extractor) -> tuple[_MockDINOv3Model, SimpleNamespace]:
+        m = _MockDINOv3Model(hidden_size=16, num_registers=2)
+        m.eval()
+        m._native_num_registers = 2  # type: ignore[attr-defined]
+        orig_forward = m.forward
+
+        def _counting_forward(
+            pixel_values: torch.Tensor, output_hidden_states: bool = False
+        ) -> object:
+            forward_calls["samples"] += int(pixel_values.shape[0])
+            return orig_forward(pixel_values, output_hidden_states=output_hidden_states)
+
+        m.forward = _counting_forward  # type: ignore[method-assign]
+        self._apply_patch_stride(m)
+        self._configure_register_pruning(m)
+        return m, mock_proc
+
+    monkeypatch.setattr(DINOv3Extractor, "_load_model", _fake_load)
+
+    device = torch.device("cpu")
+    raw_ext = RawPixelExtractor(DatasetConfig(image_size=(64, 64)), RawExtractorConfig(), device)
+    assert raw_ext.cache_features_for_training is False
+
+    ds_cfg = DatasetConfig(image_size=(128, 128), batch_size=2)
+    dv3_cfg = DINOv3ExtractorConfig(model_name="mock/dinov3-cache", stride=16)
+    extractor = DINOv3Extractor(ds_cfg, dv3_cfg, device=device, stride_factor=2)
+    assert extractor.cache_features_for_training is True
+
+    rng = np.random.default_rng(19)
+    imgs = rng.integers(0, 255, size=(4, 128, 128, 3), dtype=np.uint8)
+
+    ae_cfg = AutoencoderConfig(
+        latent_dim=8,
+        base_channels=8,
+        num_stages=2,
+        loss_type="cosine",
+        epochs=4,
+        gaussian_sigma=2.0,
+        guided_filter_radius=4,
+        loss_floor=0.0,
+    )
+    ae = RawAutoencoderModel(
+        in_channels=extractor.out_channels,
+        config=ae_cfg,
+        device=device,
+        batch_size=2,
+        use_sigmoid=extractor.is_unit_range,
+    )
+
+    recorded_calib_calls: list[tuple[tuple[int, int] | None, tuple[int, ...] | None]] = []
+    orig_score_fn = ae._score_batch_tensor
+
+    def _spy_score(
+        x: torch.Tensor,
+        target_hw: tuple[int, int] | None,
+        apply_calibration: bool = True,
+        guide_rgb: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not apply_calibration:
+            recorded_calib_calls.append(
+                (target_hw, tuple(guide_rgb.shape) if guide_rgb is not None else None)
+            )
+        return orig_score_fn(
+            x, target_hw=target_hw, apply_calibration=apply_calibration, guide_rgb=guide_rgb
+        )
+
+    monkeypatch.setattr(ae, "_score_batch_tensor", _spy_score)
+
+    losses = ae.fit(imgs, extractor)
+    assert len(losses) == 4
+    # Despite 4 epochs + calibration, the frozen ViT processed each of the 4 images only ONCE
+    assert forward_calls["samples"] == 4
+    # Calibration executed at full pixel resolution (128, 128) with matching RGB guidance
+    assert len(recorded_calib_calls) == 2
+    assert all(
+        thw == (128, 128) and gshape == (2, 3, 128, 128)
+        for thw, gshape in recorded_calib_calls
+    )
+
+
+def test_wta_density_diagnostics_and_results_extractor_column(tmp_path: Path) -> None:
+    # 1) Exact density tracking on WTASparsity2d and non-persistent state_dict
+    torch.manual_seed(0)
+    wta = WTASparsity2d(num_channels=4, spatial_window=4, lifetime_sparsity=0.25)
+    assert "train_density" not in " ".join(wta.state_dict().keys())
+
+    z = torch.rand((2, 4, 16, 16), dtype=torch.float32) + 0.1
+    wta.train()
+    out_train = wta(z)
+    # 4x4 window -> 16 slots, 2*4*4 = 32 slots/ch, k=8 -> 8*4 / (2*4*16*16) = 32/2048 = 1/64
+    expected_train = float((out_train > 0.0).float().mean().item())
+    wta.eval()
+    with torch.inference_mode():
+        out_eval = wta(z)
+    expected_eval = float((out_eval > 0.0).float().mean().item())
+
+    stats = wta.get_density_stats()
+    assert stats["train_active_density"] == pytest.approx(expected_train, abs=1e-6)
+    assert stats["eval_active_density"] == pytest.approx(expected_eval, abs=1e-6)
+    assert stats["threshold_mean"] > 0.0
+
+    # 2) End-to-end wta_ae run writes wta_diagnostics + extractor into metrics.json
+    data_root = _create_synthetic_mvtec(tmp_path / "data")
+    res_dir = tmp_path / "results"
+    cfg = PipelineConfig(
+        dataset=DatasetConfig(root_dir=data_root, image_size=(64, 64), batch_size=2, num_workers=1),
+        model_name="wta_ae",
+        autoencoder=AutoencoderConfig(
+            latent_dim=16,
+            base_channels=8,
+            num_stages=3,
+            loss_type="l2",
+            epochs=2,
+            gaussian_sigma=1.0,
+        ),
+        wta=WTAConfig(spatial_window=2, lifetime_sparsity=0.25, eval_threshold_scale=0.8),
+        output=OutputConfig(
+            base_dir=res_dir,
+            experiment_name="carpet_wta_ae_fullres_l2_s3_c8_z16",
+            save_visualizations=False,
+        ),
+        device="cpu",
+    )
+    run_pipeline(cfg)
+
+    saved = json.loads(
+        (res_dir / "carpet_wta_ae_fullres_l2_s3_c8_z16" / "metrics.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert saved["extractor"] == "raw"
+    assert "wta_diagnostics" in saved
+    assert 0.0 < saved["wta_diagnostics"]["train_active_density"] < 1.0
+    assert 0.0 < saved["wta_diagnostics"]["eval_active_density"] < 1.0
+
+    # Add an incomplete dinov3 folder to test extractor inference + Ext leaderboard column
+    (res_dir / "carpet_dinov3_cosine_s3_c128_z64").mkdir(parents=True)
+    _, records, _ = scan_results(res_dir, include_incomplete=True)
+    by_name = {r.experiment_name: r for r in records}
+    wta_rec = by_name["carpet_wta_ae_fullres_l2_s3_c8_z16"]
+    assert wta_rec.extractor == "raw"
+    assert wta_rec.wta_train_density == pytest.approx(
+        saved["wta_diagnostics"]["train_active_density"]
+    )
+    assert wta_rec.wta_eval_density == pytest.approx(
+        saved["wta_diagnostics"]["eval_active_density"]
+    )
+    dino_rec = by_name["carpet_dinov3_cosine_s3_c128_z64"]
+    assert dino_rec.extractor == "dinov3"
+    assert dino_rec.loss_type == "cosine"
+
+    table = format_leaderboard_table(records)
+    assert "Ext" in table
+    assert "raw" in table and "dinov3" in table
+
+    with (res_dir / "all_experiments_metrics.csv").open(encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert "extractor" in rows[0]
+    assert "wta_train_density" in rows[0]
+    assert "wta_eval_density" in rows[0]

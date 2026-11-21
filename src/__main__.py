@@ -144,6 +144,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Early-stopping reconstruction loss floor after epoch 20 (0 disables)",
     )
     parser.add_argument(
+        "--guided-filter-radius",
+        type=int,
+        default=8,
+        help="Fast Guided Filter radius using RGB guide edges (0 disables)",
+    )
+    parser.add_argument(
+        "--guided-filter-eps",
+        type=float,
+        default=0.01,
+        help="Fast Guided Filter regularization epsilon (> 0)",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="results",

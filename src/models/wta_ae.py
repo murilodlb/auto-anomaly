@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import numpy as np
 import torch
 
 from src.config import AutoencoderConfig, WTAConfig
@@ -59,6 +60,44 @@ class WTASparsity2d(torch.nn.Module):
             "threshold_initialized", torch.zeros(1, dtype=torch.bool)
         )  # Shape: (1,)
 
+        # Non-persistent accumulators (excluded from state_dict for checkpoint compatibility)
+        self._train_density_sum: torch.Tensor = torch.zeros((), dtype=torch.float64)
+        self._train_density_steps: int = 0
+        self._eval_density_sum: torch.Tensor = torch.zeros((), dtype=torch.float64)
+        self._eval_density_steps: int = 0
+
+    def reset_density_stats(self, mode: str = "all") -> None:
+        """Reset zero-sync bottleneck active density accumulators for 'train', 'eval', or 'all'."""
+        if mode in {"train", "all"}:
+            self._train_density_sum = torch.zeros((), dtype=torch.float64)
+            self._train_density_steps = 0
+        if mode in {"eval", "all"}:
+            self._eval_density_sum = torch.zeros((), dtype=torch.float64)
+            self._eval_density_steps = 0
+        if mode not in {"train", "eval", "all"}:
+            raise ValueError(
+                f"Unknown density reset mode {mode!r}; expected 'train', 'eval', or 'all'"
+            )
+
+    def get_density_stats(self) -> dict[str, float]:
+        """Return average active fraction during train/eval and learned EMA threshold stats."""
+        train_d = (
+            float(self._train_density_sum.item()) / float(self._train_density_steps)
+            if self._train_density_steps > 0
+            else float("nan")
+        )
+        eval_d = (
+            float(self._eval_density_sum.item()) / float(self._eval_density_steps)
+            if self._eval_density_steps > 0
+            else float("nan")
+        )
+        return {
+            "train_active_density": train_d,
+            "eval_active_density": eval_d,
+            "threshold_mean": float(self.running_threshold.mean().item()),
+            "threshold_max": float(self.running_threshold.max().item()),
+        }
+
     def _effective_window(self, h_b: int, w_b: int) -> int:
         g = math.gcd(h_b, w_b)
         for d in range(min(self.spatial_window, g), 0, -1):
@@ -107,10 +146,8 @@ class WTASparsity2d(torch.nn.Module):
                     )  # Shape: (1, Z, 1, 1)
 
             mask = (z_spatial >= batch_thresh) & (z_spatial > 0.0)  # Shape: (B, Z, H_b, W_b)
-            z_wta = z_spatial * mask.to(z_spatial.dtype)  # Shape: (B, Z, H_b, W_b)
-            return z_wta.to(z.dtype)  # Shape: (B, Z, H_b, W_b)
-
-        if (
+            z_wta = (z_spatial * mask.to(z_spatial.dtype)).to(z.dtype)  # Shape: (B, Z, H_b, W_b)
+        elif (
             not self.training
             and bool(self.threshold_initialized.item())
             and 0.0 < self.lifetime_sparsity < 1.0
@@ -119,10 +156,24 @@ class WTASparsity2d(torch.nn.Module):
                 self.running_threshold * self.eval_threshold_scale
             )  # Shape: (1, Z, 1, 1) — batch-independent eval threshold
             mask = (z_spatial >= eval_thresh) & (z_spatial > 0.0)  # Shape: (B, Z, H_b, W_b)
-            z_wta = z_spatial * mask.to(z_spatial.dtype)  # Shape: (B, Z, H_b, W_b)
-            return z_wta.to(z.dtype)  # Shape: (B, Z, H_b, W_b)
+            z_wta = (z_spatial * mask.to(z_spatial.dtype)).to(z.dtype)  # Shape: (B, Z, H_b, W_b)
+        else:
+            z_wta = z_spatial.to(z.dtype)  # Shape: (B, Z, H_b, W_b)
 
-        return z_spatial.to(z.dtype)  # Shape: (B, Z, H_b, W_b)
+        with torch.no_grad():
+            density = (z_wta > 0.0).float().mean().to(torch.float64)  # Shape: ()
+            if self.training:
+                if self._train_density_sum.device != density.device:
+                    self._train_density_sum = self._train_density_sum.to(device=density.device)
+                self._train_density_sum = self._train_density_sum + density  # Shape: ()
+                self._train_density_steps += 1
+            else:
+                if self._eval_density_sum.device != density.device:
+                    self._eval_density_sum = self._eval_density_sum.to(device=density.device)
+                self._eval_density_sum = self._eval_density_sum + density  # Shape: ()
+                self._eval_density_steps += 1
+
+        return z_wta  # Shape: (B, Z, H_b, W_b)
 
 
 class WTAConvAutoencoder(torch.nn.Module):
@@ -308,6 +359,24 @@ class WTAAutoencoderModel(RawAutoencoderModel):
             "wta_lifetime_sparsity": self.wta_config.lifetime_sparsity,
             "wta_eval_threshold_scale": self.wta_config.eval_threshold_scale,
         }
+
+    def _on_epoch_start(self, epoch: int) -> None:
+        """Reset train density accumulators each epoch so final-epoch density is reported."""
+        _ = epoch
+        self.net.wta.reset_density_stats(mode="train")
+
+    def fit(self, train_images: np.ndarray, extractor: Any) -> list[float]:
+        """Train WTA autoencoder and log bottleneck active density diagnostics."""
+        self.net.wta.reset_density_stats(mode="all")
+        epoch_losses = super().fit(train_images, extractor)
+        stats = self.net.wta.get_density_stats()
+        print(
+            f"[WTA Density] train_active={stats['train_active_density']:.4f} | "
+            f"eval_calib_active={stats['eval_active_density']:.4f} | "
+            f"thresh_mean={stats['threshold_mean']:.4f}",
+            flush=True,
+        )
+        return epoch_losses
 
     def _expected_checkpoint_meta(self) -> dict[str, Any]:
         return {

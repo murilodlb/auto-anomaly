@@ -8,7 +8,7 @@ from typing import Any
 
 import cv2
 
-VALID_LOSS_TYPES = frozenset({"l1", "l2", "smooth_l1", "l1_ssim", "ms_l1_ssim"})
+VALID_LOSS_TYPES = frozenset({"l1", "l2", "smooth_l1", "l1_ssim", "ms_l1_ssim", "cosine"})
 VALID_EXTRACTORS = frozenset({"raw", "dinov3"})
 VALID_MODELS = frozenset({"dcae", "wta_ae", "autoencoder"})
 MVTEC_CATEGORIES: tuple[str, ...] = (
@@ -137,6 +137,8 @@ class AutoencoderConfig:
     denoise_prob: float = 0.5
     texture_damping: float = 2.0
     loss_floor: float = 0.006
+    guided_filter_radius: int = 8
+    guided_filter_eps: float = 0.01
     use_amp: bool = True
     save_weights: bool = True
     load_weights: Path | None = None
@@ -315,6 +317,12 @@ class PipelineConfig:
             raise ValueError(f"texture_damping must be >= 0, got {ae.texture_damping}")
         if ae.loss_floor < 0.0:
             raise ValueError(f"loss_floor must be >= 0, got {ae.loss_floor}")
+        if ae.guided_filter_radius < 0:
+            raise ValueError(
+                f"guided_filter_radius must be >= 0, got {ae.guided_filter_radius}"
+            )
+        if ae.guided_filter_eps <= 0.0:
+            raise ValueError(f"guided_filter_eps must be > 0.0, got {ae.guided_filter_eps}")
         if ae.load_weights is not None and not ae.load_weights.is_file():
             raise FileNotFoundError(f"Checkpoint file does not exist: {ae.load_weights}")
 
@@ -392,6 +400,8 @@ class PipelineConfig:
             denoise_prob=float(kwargs.get("denoise_prob", 0.5)),
             texture_damping=float(kwargs.get("texture_damping", 2.0)),
             loss_floor=float(kwargs.get("loss_floor", 0.006)),
+            guided_filter_radius=int(kwargs.get("guided_filter_radius", 8)),
+            guided_filter_eps=float(kwargs.get("guided_filter_eps", 0.01)),
             use_amp=not bool(kwargs.get("no_amp", False)),
             save_weights=not bool(kwargs.get("no_save_weights", False)),
             load_weights=load_weights,
