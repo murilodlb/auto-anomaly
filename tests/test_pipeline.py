@@ -1540,3 +1540,37 @@ def test_wta_density_diagnostics_and_results_extractor_column(tmp_path: Path) ->
     assert "extractor" in rows[0]
     assert "wta_train_density" in rows[0]
     assert "wta_eval_density" in rows[0]
+
+
+def test_dinov3_load_model_survives_broken_auto_image_processor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    from types import ModuleType
+
+    mock_model = _MockDINOv3Model(hidden_size=16, num_registers=2)
+
+    class _FakeAutoModel:
+        @staticmethod
+        def from_pretrained(_name: str) -> _MockDINOv3Model:
+            return mock_model
+
+    fake_transformers = ModuleType("transformers")
+    fake_transformers.AutoModel = _FakeAutoModel  # type: ignore[attr-defined]
+
+    def _broken_getattr(name: str) -> object:
+        if name == "AutoImageProcessor":
+            raise ModuleNotFoundError(
+                "Could not import module 'AutoImageProcessor' (operator torchvision::nms)"
+            )
+        raise AttributeError(name)
+
+    fake_transformers.__getattr__ = _broken_getattr  # type: ignore[method-assign]
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    ds_cfg = DatasetConfig(image_size=(64, 64), batch_size=2)
+    dv3_cfg = DINOv3ExtractorConfig(model_name="mock/dinov3-fallback", stride=16)
+    extractor = DINOv3Extractor(ds_cfg, dv3_cfg, device=torch.device("cpu"), stride_factor=2)
+    loaded_model, loaded_proc = extractor._load_model()
+    assert loaded_model is mock_model
+    assert loaded_proc is None

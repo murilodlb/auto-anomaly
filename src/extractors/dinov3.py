@@ -140,12 +140,16 @@ class DINOv3Extractor:
         return self._components_cache
 
     def _load_model(self) -> tuple[Any, Any]:
-        from transformers import AutoImageProcessor, AutoModel  # pyright: ignore[reportMissingImports]
+        from transformers import AutoModel  # pyright: ignore[reportMissingImports]
 
         model_name = self.extractor_cfg.model_name
         try:
+            from transformers import (  # pyright: ignore[reportMissingImports]
+                AutoImageProcessor,
+            )
+
             processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
-        except (RuntimeError, OSError, ValueError, AttributeError) as err:
+        except (ImportError, RuntimeError, OSError, ValueError, AttributeError) as err:
             logger.warning(f"Failed to load processor for {model_name} ({err}); using ImageNet.")
             processor = None
 

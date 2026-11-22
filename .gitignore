@@ -18,3 +18,4 @@ prompt.txt
 .env
 !README.md
 *.md
+logs/*
