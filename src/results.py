@@ -31,6 +31,8 @@ _NAME_HP_PATTERN = re.compile(
 )
 
 _LOSS_ALIASES = {"l1ssim": "l1_ssim"}
+_NAME_GFR_PATTERN = re.compile(r"_gfr(?P<gfr>\d+)(?=_|-|$)")
+_NAME_DROP_PATTERN = re.compile(r"_drop(?P<drop>\d+(?:\.\d+)?)(?=_|-|$)")
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,8 @@ class ExperimentRecord:
     denoise_prob: float | None
     texture_damping: float | None
     loss_floor: float | None
+    guided_filter_radius: int | None
+    guided_filter_eps: float | None
     wta_spatial_window: int | None
     wta_lifetime_sparsity: float | None
     wta_train_density: float | None
@@ -186,7 +190,9 @@ def _format_timestamp(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _walk_artifact_stats(root: Path) -> tuple[int, int, int, float]:
+def _walk_artifact_stats(
+    root: Path, assume_in_anomaly_maps: bool = False
+) -> tuple[int, int, int, float]:
     """Return (num_heatmaps, num_tiff_maps, total_bytes, latest_mtime) for a folder."""
     num_heatmaps = 0
     num_tiff_maps = 0
@@ -199,7 +205,7 @@ def _walk_artifact_stats(root: Path) -> tuple[int, int, int, float]:
     for dirpath, _, filenames in os.walk(root):
         dir_rel = Path(dirpath).relative_to(root)
         in_heatmaps = "heatmaps" in dir_rel.parts
-        in_anomaly_maps = "anomaly_maps" in dir_rel.parts
+        in_anomaly_maps = assume_in_anomaly_maps or ("anomaly_maps" in dir_rel.parts)
         for fname in filenames:
             fpath = os.path.join(dirpath, fname)
             try:
@@ -220,26 +226,31 @@ def _walk_artifact_stats(root: Path) -> tuple[int, int, int, float]:
 
 def parse_experiment_name_hyperparams(name: str) -> dict[str, Any]:
     """Infer model/loss hyperparameters from standard test.sh experiment names."""
+    parsed: dict[str, Any] = {}
     match = _NAME_HP_PATTERN.match(name)
-    if not match:
-        return {}
-    loss_raw = match.group("loss")
-    loss_norm = _LOSS_ALIASES.get(loss_raw, loss_raw)
-    res_raw = match.group("res")
-    parsed: dict[str, Any] = {
-        "loss_type": loss_norm,
-        "num_stages": int(match.group("stages")),
-    }
-    if match.group("model") is not None:
-        parsed["model"] = match.group("model")
-    if match.group("extractor") is not None:
-        parsed["extractor"] = match.group("extractor")
-    if res_raw == "fullres":
-        parsed["full_res"] = True
-    if match.group("base_ch") is not None:
-        parsed["base_channels"] = int(match.group("base_ch"))
-    if match.group("latent") is not None:
-        parsed["latent_dim"] = int(match.group("latent"))
+    if match:
+        loss_raw = match.group("loss")
+        loss_norm = _LOSS_ALIASES.get(loss_raw, loss_raw)
+        res_raw = match.group("res")
+        parsed["loss_type"] = loss_norm
+        parsed["num_stages"] = int(match.group("stages"))
+        if match.group("model") is not None:
+            parsed["model"] = match.group("model")
+        if match.group("extractor") is not None:
+            parsed["extractor"] = match.group("extractor")
+        if res_raw == "fullres":
+            parsed["full_res"] = True
+        if match.group("base_ch") is not None:
+            parsed["base_channels"] = int(match.group("base_ch"))
+        if match.group("latent") is not None:
+            parsed["latent_dim"] = int(match.group("latent"))
+
+    gfr_match = _NAME_GFR_PATTERN.search(name)
+    if gfr_match is not None:
+        parsed["guided_filter_radius"] = int(gfr_match.group("gfr"))
+    drop_match = _NAME_DROP_PATTERN.search(name)
+    if drop_match is not None:
+        parsed["spatial_dropout"] = float(drop_match.group("drop"))
     return parsed
 
 
@@ -455,7 +466,9 @@ def _build_record_from_run_dir(
         parent_cat = str(payload.get("category", run_dir.name))
         tiff_dir = run_dir.parent / "anomaly_maps" / parent_cat
         if tiff_dir.is_dir():
-            _, num_tiff_maps, _, _ = _walk_artifact_stats(tiff_dir)
+            _, num_tiff_maps, _, _ = _walk_artifact_stats(
+                tiff_dir, assume_in_anomaly_maps=True
+            )
 
     img_sz = payload.get("image_size")
     image_size_str = (
@@ -513,6 +526,8 @@ def _build_record_from_run_dir(
             _safe_float(hp.get("texture_damping")) if "texture_damping" in hp else None
         ),
         loss_floor=_safe_float(hp.get("loss_floor")) if "loss_floor" in hp else None,
+        guided_filter_radius=_safe_int(hp.get("guided_filter_radius")),
+        guided_filter_eps=_safe_opt_float(hp.get("guided_filter_eps")),
         wta_spatial_window=_safe_int(hp.get("wta_spatial_window")),
         wta_lifetime_sparsity=(
             _safe_float(hp.get("wta_lifetime_sparsity"))
@@ -616,10 +631,12 @@ def _build_incomplete_record(inv: FolderInventoryEntry) -> ExperimentRecord:
         weight_decay=None,
         gaussian_sigma=None,
         score_top_k_pct=None,
-        spatial_dropout=None,
+        spatial_dropout=_safe_opt_float(parsed.get("spatial_dropout")),
         denoise_prob=None,
         texture_damping=None,
         loss_floor=None,
+        guided_filter_radius=_safe_int(parsed.get("guided_filter_radius")),
+        guided_filter_eps=None,
         wta_spatial_window=None,
         wta_lifetime_sparsity=None,
         wta_train_density=None,
@@ -862,8 +879,8 @@ def format_leaderboard_table(records: list[ExperimentRecord], top: int | None = 
     name_w = max(26, min(42, max(len(r.experiment_name) for r in shown) + 2))
     header = (
         f"{'Experiment':<{name_w}} {'Category':<10} {'Model':<11} {'Ext':<7} {'Loss':<10} "
-        f"{'S':>2} {'C':>3} {'Z':>3} {'Ep':>3} {'Dmp':>4} {'Dns':>4} {'AU-PRO':>7} "
-        f"{'ROC(max)':>8} {'ROC(k%)':>7} {'PixROC':>7} {'PixAP':>6} {'GoodMu':>7} "
+        f"{'S':>2} {'C':>3} {'Z':>3} {'Ep':>3} {'Drp':>4} {'GFR':>3} {'Dmp':>4} {'Dns':>4} "
+        f"{'AU-PRO':>7} {'ROC(max)':>8} {'ROC(k%)':>7} {'PixROC':>7} {'PixAP':>6} {'GoodMu':>7} "
         f"{'DefMu':>7} {'s/ep':>6}"
     )
     sep = "-" * len(header)
@@ -882,6 +899,7 @@ def format_leaderboard_table(records: list[ExperimentRecord], top: int | None = 
             f"{name:<{name_w}} {cat:<10} {mdl:<11} {ext:<7} {loss:<10} "
             f"{_fmt_opt_int(r.num_stages, 2)} {_fmt_opt_int(r.base_channels, 3)} "
             f"{_fmt_opt_int(r.latent_dim, 3)} {_fmt_opt_int(r.epochs, 3)} "
+            f"{_fmt_opt_flt(r.spatial_dropout, 4)} {_fmt_opt_int(r.guided_filter_radius, 3)} "
             f"{_fmt_opt_flt(r.texture_damping, 4)} {_fmt_opt_flt(r.denoise_prob, 4)} "
             f"{_fmt_num(r.au_pro, 4, 7)} {_fmt_num(r.classification_au_roc_max, 4, 8)} "
             f"{_fmt_num(r.image_auroc, 4, 7)} {_fmt_num(r.pixel_auroc, 4, 7)} "

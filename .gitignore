@@ -14,6 +14,15 @@ data/leather/
 data/hazelnut/
 data/bottle/
 data/transistor/
+data/tile/
+data/capsule/
+data/toothbrush/
+data/pill/
+data/metal_nut/
+data/cable/
+data/zipper/
+data/screw/
+data/grid/
 prompt.txt
 .env
 !README.md

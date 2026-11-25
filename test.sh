@@ -8,7 +8,8 @@
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 
-# sbatch --export=ALL,CATEGORY=all,LOSS=l1_ssim,NUM_STAGES=5,BASE_CHANNELS=64,LATENT_DIM=128,BATCH_SIZE=16,EPOCHS=100,GAUSSIAN_SIGMA=10.0,TOP_K_PCT=0.001,SAVE_TIFF=1,EXP_NAME=mvtec_fullres_l1ssim_s5 test.sh
+# Full 15-category MVTec AD DCAE baseline (defaults: l1, s5, c64, z128, ep150, drop0.1, gfr8, sigma=8.0, top_k=0.01):
+# sbatch --export=ALL,CATEGORY=all,SAVE_TIFF=1 test.sh
 # sbatch --export=ALL,CATEGORY=carpet,EXTRACTOR=dinov3,LOSS=cosine,NUM_STAGES=3,BASE_CHANNELS=128,LATENT_DIM=64,BATCH_SIZE=16,EPOCHS=100,GAUSSIAN_SIGMA=3.0,TOP_K_PCT=0.001,LOSS_FLOOR=0.0,DINOV3_STRIDE=16,DINOV3_PRUNE_REGISTERS=1,EXP_NAME=carpet_dinov3_cosine_s3_c128_z64 test.sh
 # Compare DCAE vs Bottleneck-WTA ConvAE (wta_ae) on carpet at 1024x1024:
 # sbatch --export=ALL,CATEGORY=carpet,MODEL=dcae,LOSS=ms_l1_ssim,NUM_STAGES=6,BASE_CHANNELS=64,LATENT_DIM=64,EPOCHS=70,SPATIAL_DROPOUT=0.25,TOP_K_PCT=0.0004,GAUSSIAN_SIGMA=6.0 test.sh
@@ -58,11 +59,11 @@ DATA_DIR="${DATA_DIR:-data}"
 CATEGORY="${CATEGORY:-carpet}"
 EXTRACTOR="${EXTRACTOR:-raw}"
 MODEL="${MODEL:-dcae}"
-EPOCHS="${EPOCHS:-70}"
+EPOCHS="${EPOCHS:-150}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 LR="${LR:-1e-3}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
-LATENT_DIM="${LATENT_DIM:-64}"
+LATENT_DIM="${LATENT_DIM:-128}"
 BASE_CHANNELS="${BASE_CHANNELS:-64}"
 if [[ "${EXTRACTOR}" == "dinov3" ]]; then
     LOSS="${LOSS:-cosine}"
@@ -70,13 +71,13 @@ if [[ "${EXTRACTOR}" == "dinov3" ]]; then
     NUM_STAGES="${NUM_STAGES:-3}"
     GAUSSIAN_SIGMA="${GAUSSIAN_SIGMA:-3.0}"
 else
-    LOSS="${LOSS:-ms_l1_ssim}"
+    LOSS="${LOSS:-l1}"
     LOSS_FLOOR="${LOSS_FLOOR:-0.006}"
-    NUM_STAGES="${NUM_STAGES:-6}"
-    GAUSSIAN_SIGMA="${GAUSSIAN_SIGMA:-6.0}"
+    NUM_STAGES="${NUM_STAGES:-5}"
+    GAUSSIAN_SIGMA="${GAUSSIAN_SIGMA:-8.0}"
 fi
-TOP_K_PCT="${TOP_K_PCT:-0.0004}"
-SPATIAL_DROPOUT="${SPATIAL_DROPOUT:-0.25}"
+TOP_K_PCT="${TOP_K_PCT:-0.01}"
+SPATIAL_DROPOUT="${SPATIAL_DROPOUT:-${DROPOUT:-0.1}}"
 DENOISE_PROB="${DENOISE_PROB:-0.5}"
 TEXTURE_DAMPING="${TEXTURE_DAMPING:-2.0}"
 GUIDED_FILTER_RADIUS="${GUIDED_FILTER_RADIUS:-8}"
@@ -84,19 +85,30 @@ GUIDED_FILTER_EPS="${GUIDED_FILTER_EPS:-0.01}"
 WTA_SPATIAL_WINDOW="${WTA_SPATIAL_WINDOW:-4}"
 WTA_LIFETIME_SPARSITY="${WTA_LIFETIME_SPARSITY:-0.2}"
 WTA_EVAL_SCALE="${WTA_EVAL_SCALE:-0.8}"
+SAVE_TIFF="${SAVE_TIFF:-0}"
 SEED="${SEED:-42}"
 NUM_WORKERS="${SLURM_CPUS_PER_TASK:-8}"
+
+CUSTOM_EXP_NAME=0
+if [[ -n "${EXP_NAME:-}" ]]; then
+    CUSTOM_EXP_NAME=1
+fi
+
+TIFF_SUFFIX=""
+if [[ "${SAVE_TIFF}" == "1" ]]; then
+    TIFF_SUFFIX="_tiff"
+fi
 if [[ "${EXTRACTOR}" == "raw" ]]; then
-    EXP_NAME="${EXP_NAME:-${CATEGORY}_${MODEL}_fullres_${LOSS}_s${NUM_STAGES}_c${BASE_CHANNELS}_z${LATENT_DIM}}"
+    EXP_NAME="${EXP_NAME:-${CATEGORY}_${MODEL}_fullres_${LOSS}_s${NUM_STAGES}_c${BASE_CHANNELS}_z${LATENT_DIM}_ep${EPOCHS}_drop${SPATIAL_DROPOUT}_gfr${GUIDED_FILTER_RADIUS}${TIFF_SUFFIX}}"
 else
-    EXP_NAME="${EXP_NAME:-${CATEGORY}_${MODEL}_fullres_${EXTRACTOR}_${LOSS}_s${NUM_STAGES}_c${BASE_CHANNELS}_z${LATENT_DIM}}"
+    EXP_NAME="${EXP_NAME:-${CATEGORY}_${MODEL}_fullres_${EXTRACTOR}_${LOSS}_s${NUM_STAGES}_c${BASE_CHANNELS}_z${LATENT_DIM}_ep${EPOCHS}_drop${SPATIAL_DROPOUT}_gfr${GUIDED_FILTER_RADIUS}${TIFF_SUFFIX}}"
 fi
 
 EXTRA_ARGS=()
 if [[ "${FULL_RES:-1}" == "1" ]]; then
     EXTRA_ARGS+=(--full-res)
 fi
-if [[ "${SAVE_TIFF:-0}" == "1" ]]; then
+if [[ "${SAVE_TIFF}" == "1" ]]; then
     EXTRA_ARGS+=(--save-tiff)
 fi
 if [[ "${EXTRACTOR}" == "dinov3" ]]; then
@@ -123,6 +135,37 @@ if [[ "${EXTRACTOR}" == "dinov3" ]]; then
         EXTRA_ARGS+=(--dinov3-plain-last-hidden-state)
     fi
 fi
+
+if [[ "${CUSTOM_EXP_NAME}" == "1" ]]; then
+    if [[ "${EXP_NAME}" =~ (^|[_-])drop([0-9]+(\.[0-9]+)?)($|[_-]) ]]; then
+        _name_drop="${BASH_REMATCH[2]}"
+        if awk -v a="${_name_drop}" -v b="${SPATIAL_DROPOUT}" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d > 1e-9) }'; then
+            echo "[WARN] Custom EXP_NAME '${EXP_NAME}' encodes drop=${_name_drop}, but resolved SPATIAL_DROPOUT=${SPATIAL_DROPOUT}!"
+        fi
+    fi
+    if [[ "${EXP_NAME}" =~ (^|[_-])ep([0-9]+)($|[_-]) ]]; then
+        _name_ep="${BASH_REMATCH[2]}"
+        if awk -v a="${_name_ep}" -v b="${EPOCHS}" 'BEGIN { exit !(a != b) }'; then
+            echo "[WARN] Custom EXP_NAME '${EXP_NAME}' encodes ep=${_name_ep}, but resolved EPOCHS=${EPOCHS}!"
+        fi
+    fi
+fi
+
+echo "------------------------------------------------------------"
+echo "Resolved Experiment Configuration:"
+echo "  EXP_NAME             : ${EXP_NAME}"
+echo "  CATEGORY             : ${CATEGORY}"
+echo "  MODEL / EXTRACTOR    : ${MODEL} / ${EXTRACTOR}"
+echo "  LOSS / LOSS_FLOOR    : ${LOSS} / ${LOSS_FLOOR}"
+echo "  ARCH (S / C / Z)     : ${NUM_STAGES} / ${BASE_CHANNELS} / ${LATENT_DIM}"
+echo "  EPOCHS / BATCH_SIZE  : ${EPOCHS} / ${BATCH_SIZE}"
+echo "  SPATIAL_DROPOUT      : ${SPATIAL_DROPOUT}"
+echo "  DENOISE_PROB         : ${DENOISE_PROB}"
+echo "  GAUSSIAN_SIGMA       : ${GAUSSIAN_SIGMA}"
+echo "  TOP_K_PCT            : ${TOP_K_PCT}"
+echo "  GUIDED_FILTER_RADIUS : ${GUIDED_FILTER_RADIUS} (eps=${GUIDED_FILTER_EPS})"
+echo "  SAVE_TIFF / SEED     : ${SAVE_TIFF} / ${SEED}"
+echo "------------------------------------------------------------"
 
 echo "[2/2] Launching Experiment: ${EXP_NAME} (Category: ${CATEGORY}, Model: ${MODEL}, Extractor: ${EXTRACTOR})"
 "${PYTHON_RUN[@]}" -m src \

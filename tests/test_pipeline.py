@@ -47,9 +47,14 @@ from src.models.dcae import (
     _ssim_map,
 )
 from src.models.wta_ae import WTAAutoencoderModel, WTAConvAutoencoder, WTASparsity2d
-from src.results import format_leaderboard_table, inspect_results_folders, scan_results
+from src.results import (
+    format_leaderboard_table,
+    inspect_results_folders,
+    parse_experiment_name_hyperparams,
+    scan_results,
+)
 from src.results import main as results_main
-from src.run import run_pipeline
+from src.run import _compute_group_means, _print_multi_category_table, run_pipeline
 
 
 def _create_synthetic_mvtec(root: Path, category: str = "carpet") -> Path:
@@ -359,6 +364,176 @@ def test_multi_category_pipeline(tmp_path: Path) -> None:
     assert (
         out_base / "multi_smoke" / "anomaly_maps" / "leather" / "test" / "hole" / "000.tiff"
     ).is_file()
+
+    inv, records, _ = scan_results(out_base)
+    inv_map = {entry.folder_name: entry for entry in inv}
+    assert inv_map["multi_smoke"].num_tiff_maps == 8
+
+    rec_map = {rec.experiment_name: rec for rec in records}
+    assert rec_map["multi_smoke/carpet"].num_tiff_maps == 4
+    assert rec_map["multi_smoke/leather"].num_tiff_maps == 4
+
+    with (out_base / "all_experiments_metrics.csv").open(encoding="utf-8") as f:
+        csv_rows = {row["experiment_name"]: row for row in csv.DictReader(f)}
+    assert csv_rows["multi_smoke/carpet"]["num_tiff_maps"] == "4"
+    assert csv_rows["multi_smoke/leather"]["num_tiff_maps"] == "4"
+
+    saved_summary = json.loads(
+        (out_base / "multi_smoke" / "summary_metrics.json").read_text(encoding="utf-8")
+    )
+    per_cat = saved_summary["per_category"]
+    for mean_key, metric_key in (
+        ("mean_au_pro", "au_pro"),
+        ("mean_classification_au_roc_max", "classification_au_roc_max"),
+        ("mean_image_auroc", "image_auroc"),
+        ("mean_image_ap", "image_ap"),
+        ("mean_f1_max", "f1_max"),
+        ("mean_pixel_auroc", "pixel_auroc"),
+        ("mean_pixel_ap", "pixel_ap"),
+        ("mean_pixel_f1_max", "pixel_f1_max"),
+    ):
+        expected_mean = (
+            per_cat["carpet"]["metrics"][metric_key] + per_cat["leather"]["metrics"][metric_key]
+        ) / 2.0
+        assert saved_summary[mean_key] == pytest.approx(expected_mean)
+
+    assert "textures" in saved_summary["group_means"]
+    assert "objects" not in saved_summary["group_means"]
+    assert saved_summary["group_means"]["textures"]["mean_pixel_ap"] == pytest.approx(
+        saved_summary["mean_pixel_ap"]
+    )
+    assert saved_summary["group_means"]["textures"]["mean_pixel_f1_max"] == pytest.approx(
+        saved_summary["mean_pixel_f1_max"]
+    )
+
+
+def test_multi_category_group_means_and_table(capsys: pytest.CaptureFixture[str]) -> None:
+    per_category = {
+        "carpet": {
+            "metrics": {
+                "au_pro": 0.90,
+                "classification_au_roc_max": 0.80,
+                "image_auroc": 0.82,
+                "image_ap": 0.84,
+                "f1_max": 0.86,
+                "pixel_auroc": 0.92,
+                "pixel_ap": 0.40,
+                "pixel_f1_max": 0.45,
+            }
+        },
+        "bottle": {
+            "metrics": {
+                "au_pro": 0.70,
+                "classification_au_roc_max": 0.60,
+                "image_auroc": 0.62,
+                "image_ap": 0.64,
+                "f1_max": 0.66,
+                "pixel_auroc": 0.88,
+                "pixel_ap": 0.20,
+                "pixel_f1_max": 0.25,
+            }
+        },
+    }
+    group_means = _compute_group_means(per_category)
+    assert set(group_means.keys()) == {"textures", "objects"}
+    assert group_means["textures"]["mean_pixel_ap"] == pytest.approx(0.40)
+    assert group_means["objects"]["mean_pixel_f1_max"] == pytest.approx(0.25)
+
+    _print_multi_category_table("mvtec_test", per_category, pro_limit=0.3)
+    out = capsys.readouterr().out
+    assert "=" * 104 in out
+    assert "Pixel AP" in out
+    assert "Pixel F1" in out
+    assert "Textures" in out
+    assert "Objects" in out
+    assert "Mean" in out
+
+
+def test_results_guided_filter_and_name_parsing(tmp_path: Path) -> None:
+    parsed_std = parse_experiment_name_hyperparams(
+        "all_dcae_fullres_l1_s5_c64_z128_ep150_drop0.3_gfr8_tiff"
+    )
+    assert parsed_std["model"] == "dcae"
+    assert parsed_std["full_res"] is True
+    assert parsed_std["loss_type"] == "l1"
+    assert parsed_std["num_stages"] == 5
+    assert parsed_std["base_channels"] == 64
+    assert parsed_std["latent_dim"] == 128
+    assert parsed_std["spatial_dropout"] == pytest.approx(0.3)
+    assert parsed_std["guided_filter_radius"] == 8
+
+    parsed_custom = parse_experiment_name_hyperparams("custom_run_drop0.25_gfr0")
+    assert parsed_custom["spatial_dropout"] == pytest.approx(0.25)
+    assert parsed_custom["guided_filter_radius"] == 0
+
+    res_dir = tmp_path / "results"
+    rec_dir = res_dir / "carpet_dcae_fullres_l1_s5_c64_z128_ep150_drop0.1_gfr8"
+    rec_dir.mkdir(parents=True)
+    (rec_dir / "metrics.json").write_text(
+        json.dumps(
+            {
+                "experiment_name": rec_dir.name,
+                "category": "carpet",
+                "device": "cuda",
+                "image_size": [1024, 1024],
+                "num_train": 10,
+                "num_test": 4,
+                "hyperparams": {
+                    "model": "dcae",
+                    "extractor": "raw",
+                    "loss_type": "l1",
+                    "num_stages": 5,
+                    "base_channels": 64,
+                    "latent_dim": 128,
+                    "epochs": 150,
+                    "spatial_dropout": 0.1,
+                    "guided_filter_radius": 8,
+                    "guided_filter_eps": 0.01,
+                },
+                "epoch_losses": [0.2, 0.1],
+                "metrics": {
+                    "au_pro": 0.90,
+                    "classification_au_roc_max": 0.85,
+                    "image_auroc": 0.84,
+                    "pixel_auroc": 0.95,
+                    "pixel_ap": 0.42,
+                    "per_defect": {},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    inc_dir = res_dir / "carpet_dcae_fullres_l1_s5_c64_z128_ep150_drop0.3_gfr8"
+    inc_dir.mkdir(parents=True)
+
+    _, records, _ = scan_results(res_dir, include_incomplete=True)
+    by_name = {rec.experiment_name: rec for rec in records}
+
+    rec = by_name[rec_dir.name]
+    assert rec.guided_filter_radius == 8
+    assert rec.guided_filter_eps == pytest.approx(0.01)
+    assert rec.spatial_dropout == pytest.approx(0.1)
+
+    inc = by_name[inc_dir.name]
+    assert inc.guided_filter_radius == 8
+    assert inc.guided_filter_eps is None
+    assert inc.spatial_dropout == pytest.approx(0.3)
+
+    table = format_leaderboard_table(records)
+    assert "Drp" in table and "GFR" in table
+    assert "0.3" in table and "8" in table
+
+    results_main(["--results-dir", str(res_dir), "--include-incomplete"])
+    with (res_dir / "all_experiments_metrics.csv").open(encoding="utf-8") as f:
+        csv_rows = {row["experiment_name"]: row for row in csv.DictReader(f)}
+    assert "guided_filter_radius" in csv_rows[rec_dir.name]
+    assert "guided_filter_eps" in csv_rows[rec_dir.name]
+    assert csv_rows[rec_dir.name]["guided_filter_radius"] == "8"
+    assert csv_rows[rec_dir.name]["guided_filter_eps"] == "0.01"
+    assert csv_rows[inc_dir.name]["guided_filter_radius"] == "8"
+    assert csv_rows[inc_dir.name]["guided_filter_eps"] == ""
+    assert csv_rows[inc_dir.name]["spatial_dropout"] == "0.3"
 
 
 def _naive_2d_ssim_map(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.Tensor:

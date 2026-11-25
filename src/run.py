@@ -443,42 +443,96 @@ def _run_single_category(
     return results_payload
 
 
+_MVTEC_TEXTURE_CATEGORIES = frozenset({"carpet", "grid", "leather", "tile", "wood"})
+_SUMMARY_METRIC_KEYS: tuple[tuple[str, str], ...] = (
+    ("mean_au_pro", "au_pro"),
+    ("mean_classification_au_roc_max", "classification_au_roc_max"),
+    ("mean_image_auroc", "image_auroc"),
+    ("mean_image_ap", "image_ap"),
+    ("mean_f1_max", "f1_max"),
+    ("mean_pixel_auroc", "pixel_auroc"),
+    ("mean_pixel_ap", "pixel_ap"),
+    ("mean_pixel_f1_max", "pixel_f1_max"),
+)
+
+
+def _safe_nanmean(values: list[float]) -> float:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0 or bool(np.all(np.isnan(arr))):
+        return float("nan")
+    return float(np.nanmean(arr))
+
+
+def _aggregate_category_means(entries: list[dict[str, Any]]) -> dict[str, float]:
+    return {
+        out_key: _safe_nanmean([float(p["metrics"][metric_key]) for p in entries])
+        for out_key, metric_key in _SUMMARY_METRIC_KEYS
+    }
+
+
+def _compute_group_means(
+    per_category: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, float]]:
+    textures = [p for cat, p in per_category.items() if cat in _MVTEC_TEXTURE_CATEGORIES]
+    objects = [p for cat, p in per_category.items() if cat not in _MVTEC_TEXTURE_CATEGORIES]
+    group_means: dict[str, dict[str, float]] = {}
+    if textures:
+        group_means["textures"] = _aggregate_category_means(textures)
+    if objects:
+        group_means["objects"] = _aggregate_category_means(objects)
+    return group_means
+
+
 def _print_multi_category_table(
     experiment_name: str,
     per_category: dict[str, dict[str, Any]],
     pro_limit: float,
 ) -> None:
-    print("\n" + "=" * 78)
+    width = 104
+    print("\n" + "=" * width)
     print(f"MVTec AD Multi-Category Summary: {experiment_name} (PRO limit={pro_limit:g})")
-    print("=" * 78)
+    print("=" * width)
     print(
         f"{'Category':<18} {'AU-PRO':>10} {'AU-ROC(max)':>12} "
-        f"{'AUROC(top-k)':>13} {'Pixel AUROC':>12}"
+        f"{'AUROC(top-k)':>13} {'Pixel AUROC':>12} {'Pixel AP':>11} {'Pixel F1':>11}"
     )
-    print("-" * 78)
+    print("-" * width)
 
-    au_pros, roc_maxs, roc_topks, pix_rocs = [], [], [], []
     for cat, payload in per_category.items():
         m = payload["metrics"]
-        au_pros.append(m["au_pro"])
-        roc_maxs.append(m["classification_au_roc_max"])
-        roc_topks.append(m["image_auroc"])
-        pix_rocs.append(m["pixel_auroc"])
         print(
             f"{cat:<18} {_format_metric(m['au_pro']):>10} "
             f"{_format_metric(m['classification_au_roc_max']):>12} "
             f"{_format_metric(m['image_auroc']):>13} "
-            f"{_format_metric(m['pixel_auroc']):>12}"
+            f"{_format_metric(m['pixel_auroc']):>12} "
+            f"{_format_metric(m['pixel_ap']):>11} "
+            f"{_format_metric(m['pixel_f1_max']):>11}"
         )
 
-    print("-" * 78)
+    print("-" * width)
+    group_means = _compute_group_means(per_category)
+    if "textures" in group_means and "objects" in group_means:
+        for label, gkey in (("Textures", "textures"), ("Objects", "objects")):
+            gm = group_means[gkey]
+            print(
+                f"{label:<18} {_format_metric(gm['mean_au_pro']):>10} "
+                f"{_format_metric(gm['mean_classification_au_roc_max']):>12} "
+                f"{_format_metric(gm['mean_image_auroc']):>13} "
+                f"{_format_metric(gm['mean_pixel_auroc']):>12} "
+                f"{_format_metric(gm['mean_pixel_ap']):>11} "
+                f"{_format_metric(gm['mean_pixel_f1_max']):>11}"
+            )
+
+    overall = _aggregate_category_means(list(per_category.values()))
     print(
-        f"{'Mean':<18} {_format_metric(float(np.nanmean(au_pros))):>10} "
-        f"{_format_metric(float(np.nanmean(roc_maxs))):>12} "
-        f"{_format_metric(float(np.nanmean(roc_topks))):>13} "
-        f"{_format_metric(float(np.nanmean(pix_rocs))):>12}"
+        f"{'Mean':<18} {_format_metric(overall['mean_au_pro']):>10} "
+        f"{_format_metric(overall['mean_classification_au_roc_max']):>12} "
+        f"{_format_metric(overall['mean_image_auroc']):>13} "
+        f"{_format_metric(overall['mean_pixel_auroc']):>12} "
+        f"{_format_metric(overall['mean_pixel_ap']):>11} "
+        f"{_format_metric(overall['mean_pixel_f1_max']):>11}"
     )
-    print("=" * 78 + "\n")
+    print("=" * width + "\n")
 
 
 def run_multi_category_pipeline(config: PipelineConfig) -> dict[str, Any]:
@@ -527,20 +581,14 @@ def run_multi_category_pipeline(config: PipelineConfig) -> dict[str, Any]:
         config.pro_integration_limit,
     )
 
+    overall_means = _aggregate_category_means(list(per_category.values()))
+    group_means = _compute_group_means(per_category)
     summary_payload: dict[str, Any] = {
         "experiment_name": config.output.experiment_name,
         "categories": categories,
         "pro_integration_limit": config.pro_integration_limit,
-        "mean_au_pro": float(np.nanmean([p["metrics"]["au_pro"] for p in per_category.values()])),
-        "mean_classification_au_roc_max": float(
-            np.nanmean([p["metrics"]["classification_au_roc_max"] for p in per_category.values()])
-        ),
-        "mean_image_auroc": float(
-            np.nanmean([p["metrics"]["image_auroc"] for p in per_category.values()])
-        ),
-        "mean_pixel_auroc": float(
-            np.nanmean([p["metrics"]["pixel_auroc"] for p in per_category.values()])
-        ),
+        **overall_means,
+        "group_means": group_means,
         "per_category": per_category,
     }
 
