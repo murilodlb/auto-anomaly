@@ -82,6 +82,9 @@ DENOISE_PROB="${DENOISE_PROB:-0.5}"
 TEXTURE_DAMPING="${TEXTURE_DAMPING:-2.0}"
 GUIDED_FILTER_RADIUS="${GUIDED_FILTER_RADIUS:-8}"
 GUIDED_FILTER_EPS="${GUIDED_FILTER_EPS:-0.01}"
+GRAD_LOSS_WEIGHT="${GRAD_LOSS_WEIGHT:-2.0}"
+RIAD_PATCH_SIZES="${RIAD_PATCH_SIZES:-}"
+RIAD_NUM_MASKS="${RIAD_NUM_MASKS:-4}"
 WTA_SPATIAL_WINDOW="${WTA_SPATIAL_WINDOW:-4}"
 WTA_LIFETIME_SPARSITY="${WTA_LIFETIME_SPARSITY:-0.2}"
 WTA_EVAL_SCALE="${WTA_EVAL_SCALE:-0.8}"
@@ -94,14 +97,24 @@ if [[ -n "${EXP_NAME:-}" ]]; then
     CUSTOM_EXP_NAME=1
 fi
 
+RIAD_SUFFIX=""
+_riad_arr=()
+if [[ -n "${RIAD_PATCH_SIZES}" ]]; then
+    read -r -a _riad_arr <<< "${RIAD_PATCH_SIZES}"
+    if (( ${#_riad_arr[@]} > 0 )); then
+        _riad_joined="$(IFS=-; echo "${_riad_arr[*]}")"
+        RIAD_SUFFIX="_riad${_riad_joined}"
+    fi
+fi
+
 TIFF_SUFFIX=""
 if [[ "${SAVE_TIFF}" == "1" ]]; then
     TIFF_SUFFIX="_tiff"
 fi
 if [[ "${EXTRACTOR}" == "raw" ]]; then
-    EXP_NAME="${EXP_NAME:-${CATEGORY}_${MODEL}_fullres_${LOSS}_s${NUM_STAGES}_c${BASE_CHANNELS}_z${LATENT_DIM}_ep${EPOCHS}_drop${SPATIAL_DROPOUT}_gfr${GUIDED_FILTER_RADIUS}${TIFF_SUFFIX}}"
+    EXP_NAME="${EXP_NAME:-${CATEGORY}_${MODEL}_fullres_${LOSS}_s${NUM_STAGES}_c${BASE_CHANNELS}_z${LATENT_DIM}_ep${EPOCHS}_drop${SPATIAL_DROPOUT}_gfr${GUIDED_FILTER_RADIUS}${RIAD_SUFFIX}${TIFF_SUFFIX}}"
 else
-    EXP_NAME="${EXP_NAME:-${CATEGORY}_${MODEL}_fullres_${EXTRACTOR}_${LOSS}_s${NUM_STAGES}_c${BASE_CHANNELS}_z${LATENT_DIM}_ep${EPOCHS}_drop${SPATIAL_DROPOUT}_gfr${GUIDED_FILTER_RADIUS}${TIFF_SUFFIX}}"
+    EXP_NAME="${EXP_NAME:-${CATEGORY}_${MODEL}_fullres_${EXTRACTOR}_${LOSS}_s${NUM_STAGES}_c${BASE_CHANNELS}_z${LATENT_DIM}_ep${EPOCHS}_drop${SPATIAL_DROPOUT}_gfr${GUIDED_FILTER_RADIUS}${RIAD_SUFFIX}${TIFF_SUFFIX}}"
 fi
 
 EXTRA_ARGS=()
@@ -110,6 +123,9 @@ if [[ "${FULL_RES:-1}" == "1" ]]; then
 fi
 if [[ "${SAVE_TIFF}" == "1" ]]; then
     EXTRA_ARGS+=(--save-tiff)
+fi
+if (( ${#_riad_arr[@]} > 0 )); then
+    EXTRA_ARGS+=(--riad-patch-sizes "${_riad_arr[@]}")
 fi
 if [[ "${EXTRACTOR}" == "dinov3" ]]; then
     if [[ -n "${DINOV3_MODEL:-}" ]]; then
@@ -164,6 +180,8 @@ echo "  DENOISE_PROB         : ${DENOISE_PROB}"
 echo "  GAUSSIAN_SIGMA       : ${GAUSSIAN_SIGMA}"
 echo "  TOP_K_PCT            : ${TOP_K_PCT}"
 echo "  GUIDED_FILTER_RADIUS : ${GUIDED_FILTER_RADIUS} (eps=${GUIDED_FILTER_EPS})"
+echo "  GRAD_LOSS_WEIGHT     : ${GRAD_LOSS_WEIGHT}"
+echo "  RIAD_PATCH_SIZES     : ${RIAD_PATCH_SIZES:-disabled} (masks=${RIAD_NUM_MASKS})"
 echo "  SAVE_TIFF / SEED     : ${SAVE_TIFF} / ${SEED}"
 echo "------------------------------------------------------------"
 
@@ -189,6 +207,8 @@ echo "[2/2] Launching Experiment: ${EXP_NAME} (Category: ${CATEGORY}, Model: ${M
     --loss-floor "${LOSS_FLOOR}" \
     --guided-filter-radius "${GUIDED_FILTER_RADIUS}" \
     --guided-filter-eps "${GUIDED_FILTER_EPS}" \
+    --grad-loss-weight "${GRAD_LOSS_WEIGHT}" \
+    --riad-num-masks "${RIAD_NUM_MASKS}" \
     --wta-spatial-window "${WTA_SPATIAL_WINDOW}" \
     --wta-lifetime-sparsity "${WTA_LIFETIME_SPARSITY}" \
     --wta-eval-scale "${WTA_EVAL_SCALE}" \

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 import random
 import time
@@ -47,6 +48,43 @@ def _ssim_map(x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.
     return (ssim_n / ssim_d).clamp(0.0, 1.0)
 
 
+def _to_luminance(x: torch.Tensor) -> torch.Tensor:
+    """Convert (B, C, H, W) tensor to 1-channel float32 luminance (B, 1, H, W)."""
+    x_f32 = x.float()  # Shape: (B, C, H, W)
+    if x_f32.shape[1] == 3:
+        return (
+            0.299 * x_f32[:, 0:1, :, :]
+            + 0.587 * x_f32[:, 1:2, :, :]
+            + 0.114 * x_f32[:, 2:3, :, :]
+        )  # Shape: (B, 1, H, W)
+    return x_f32.mean(dim=1, keepdim=True)  # Shape: (B, 1, H, W)
+
+
+def _sobel_gradients(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute depthwise horizontal and vertical 3x3 Sobel gradients (gx, gy)."""
+    x_f32 = x.float()  # Shape: (B, C, H, W)
+    c_ch = x_f32.shape[1]
+    kx_base = (
+        torch.tensor(
+            [[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]],
+            dtype=torch.float32,
+            device=x_f32.device,
+        )
+        / 4.0
+    )  # Shape: (3, 3)
+    ky_base = kx_base.t().contiguous()  # Shape: (3, 3)
+    kx = kx_base.view(1, 1, 3, 3).expand(c_ch, 1, 3, 3).contiguous()  # Shape: (C, 1, 3, 3)
+    ky = ky_base.view(1, 1, 3, 3).expand(c_ch, 1, 3, 3).contiguous()  # Shape: (C, 1, 3, 3)
+
+    pad_mode = "reflect" if min(x_f32.shape[-2], x_f32.shape[-1]) > 1 else "replicate"
+    x_pad = torch.nn.functional.pad(
+        x_f32, (1, 1, 1, 1), mode=pad_mode
+    )  # Shape: (B, C, H + 2, W + 2)
+    gx = torch.nn.functional.conv2d(x_pad, kx, groups=c_ch)  # Shape: (B, C, H, W)
+    gy = torch.nn.functional.conv2d(x_pad, ky, groups=c_ch)  # Shape: (B, C, H, W)
+    return gx, gy
+
+
 def _gms_map(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -54,37 +92,45 @@ def _gms_map(
     window_size: int = 11,
 ) -> torch.Tensor:
     """Compute smoothed per-pixel (B, C, H, W) Gradient Magnitude Similarity (GMS) in [0, 1]."""
-    x_f32 = x.float()
-    y_f32 = y.float()
-    c_ch = x_f32.shape[1]
+    gx_x, gy_x = _sobel_gradients(x)  # Shape: (B, C, H, W) each
+    gx_y, gy_y = _sobel_gradients(y)  # Shape: (B, C, H, W) each
 
-    sobel_x_base = (
-        torch.tensor(
-            [[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]],
-            dtype=torch.float32,
-            device=x_f32.device,
-        )
-        / 4.0
-    )
-    sobel_y_base = sobel_x_base.t().contiguous()
-    kx = sobel_x_base.view(1, 1, 3, 3).expand(c_ch, 1, 3, 3).contiguous()
-    ky = sobel_y_base.view(1, 1, 3, 3).expand(c_ch, 1, 3, 3).contiguous()
-
-    pad_mode = "reflect" if min(x_f32.shape[-2], x_f32.shape[-1]) > 1 else "replicate"
-    x_pad = torch.nn.functional.pad(x_f32, (1, 1, 1, 1), mode=pad_mode)
-    y_pad = torch.nn.functional.pad(y_f32, (1, 1, 1, 1), mode=pad_mode)
-
-    gx_x = torch.nn.functional.conv2d(x_pad, kx, groups=c_ch)
-    gy_x = torch.nn.functional.conv2d(x_pad, ky, groups=c_ch)
-    gx_y = torch.nn.functional.conv2d(y_pad, kx, groups=c_ch)
-    gy_y = torch.nn.functional.conv2d(y_pad, ky, groups=c_ch)
-
-    grad_x = torch.sqrt(gx_x * gx_x + gy_x * gy_x + 1e-12)
-    grad_y = torch.sqrt(gx_y * gx_y + gy_y * gy_y + 1e-12)
+    grad_x = torch.sqrt(gx_x * gx_x + gy_x * gy_x + 1e-12)  # Shape: (B, C, H, W)
+    grad_y = torch.sqrt(gx_y * gx_y + gy_y * gy_y + 1e-12)  # Shape: (B, C, H, W)
 
     gms = (2.0 * grad_x * grad_y + c) / (grad_x * grad_x + grad_y * grad_y + c)
-    gms_err = _separable_avg_pool2d((1.0 - gms).clamp(0.0, 1.0), window_size=window_size)
-    return (1.0 - gms_err).clamp(0.0, 1.0)
+    gms_err = _separable_avg_pool2d(
+        (1.0 - gms).clamp(0.0, 1.0), window_size=window_size
+    )  # Shape: (B, C, H, W)
+    return (1.0 - gms_err).clamp(0.0, 1.0)  # Shape: (B, C, H, W)
+
+
+def _iter_ms_grad_l1_scales(
+    x_hat: torch.Tensor,
+    x: torch.Tensor,
+) -> list[tuple[float, torch.Tensor]]:
+    """Return weighted (weight, grad_l1_map) pairs on grayscale luminance at 1x, 0.5x, 0.25x."""
+    y_hat = _to_luminance(x_hat)  # Shape: (B, 1, H, W)
+    y = _to_luminance(x)  # Shape: (B, 1, H, W)
+    h, w = y.shape[-2], y.shape[-1]
+    maps: list[tuple[float, torch.Tensor]] = []
+    for scale, weight in ((1, 0.40), (2, 0.35), (4, 0.25)):
+        if min(h, w) < scale:
+            continue
+        if scale == 1:
+            y_hat_s, y_s = y_hat, y  # Shape: (B, 1, H, W)
+        else:
+            y_hat_s = torch.nn.functional.avg_pool2d(
+                y_hat, kernel_size=scale
+            )  # Shape: (B, 1, H//scale, W//scale)
+            y_s = torch.nn.functional.avg_pool2d(
+                y, kernel_size=scale
+            )  # Shape: (B, 1, H//scale, W//scale)
+        gx_hat, gy_hat = _sobel_gradients(y_hat_s)  # Shape: (B, 1, H_s, W_s) each
+        gx, gy = _sobel_gradients(y_s)  # Shape: (B, 1, H_s, W_s) each
+        grad_err = 0.5 * ((gx - gx_hat).abs() + (gy - gy_hat).abs())  # Shape: (B, 1, H_s, W_s)
+        maps.append((weight, grad_err))
+    return maps
 
 
 def _iter_msgms_error_scales(
@@ -138,6 +184,19 @@ def _ms_l1_ssim_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return 0.2 * l1 + 0.8 * struct_err
 
 
+def _l1_grad_loss(
+    x_hat: torch.Tensor,
+    x: torch.Tensor,
+    grad_weight: float = 2.0,
+) -> torch.Tensor:
+    """Combined RGB L1 + multi-scale grayscale luminance Sobel directional gradient L1 loss."""
+    l1 = torch.nn.functional.l1_loss(x_hat.float(), x.float())  # Shape: ()
+    scales = _iter_ms_grad_l1_scales(x_hat, x)
+    total_w = sum(w for w, _ in scales)
+    grad_l1 = torch.stack([w * s.mean() for w, s in scales]).sum() / total_w  # Shape: ()
+    return (l1 + grad_weight * grad_l1) / (1.0 + grad_weight)  # Shape: ()
+
+
 def _cosine_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """Compute channel-dimension-invariant cosine distance loss in [0, 2]."""
     # Shape: x_hat and x are (B, C, H, W)
@@ -147,17 +206,23 @@ def _cosine_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return (1.0 - cos).mean()  # Shape: ()
 
 
-_LOSS_FUNCTIONS = {
+_LOSS_FUNCTIONS: dict[str, Any] = {
     "l1": torch.nn.functional.l1_loss,
     "l2": torch.nn.functional.mse_loss,
     "smooth_l1": torch.nn.functional.smooth_l1_loss,
     "l1_ssim": _l1_ssim_loss,
     "ms_l1_ssim": _ms_l1_ssim_loss,
+    "l1_grad": _l1_grad_loss,
     "cosine": _cosine_loss,
 }
 
 
-def _compute_raw_error_map(x_hat: torch.Tensor, x: torch.Tensor, loss_type: str) -> torch.Tensor:
+def _compute_raw_error_map(
+    x_hat: torch.Tensor,
+    x: torch.Tensor,
+    loss_type: str,
+    grad_weight: float = 2.0,
+) -> torch.Tensor:
     """Compute per-pixel (B, 1, H, W) reconstruction error map in float32."""
     x_hat_f32 = x_hat.float()  # Shape: (B, C, H, W)
     x_f32 = x.float()  # Shape: (B, C, H, W)
@@ -198,7 +263,105 @@ def _compute_raw_error_map(x_hat: torch.Tensor, x: torch.Tensor, loss_type: str)
             torch.stack(upsampled_scales, dim=0).sum(dim=0) / total_weight
         )  # Shape: (B, 1, H, W)
         return 0.2 * l1_map + 0.8 * ssim_err_map  # Shape: (B, 1, H, W)
+    if loss_type == "l1_grad":
+        l1_map = (x_f32 - x_hat_f32).abs().mean(dim=1, keepdim=True)  # Shape: (B, 1, H, W)
+        target_hw = (x_f32.shape[-2], x_f32.shape[-1])
+        weighted_scales = _iter_ms_grad_l1_scales(x_hat_f32, x_f32)
+        total_w = sum(w for w, _ in weighted_scales)
+        upsampled_scales = [
+            w
+            * (
+                s
+                if s.shape[-2:] == target_hw
+                else torch.nn.functional.interpolate(
+                    s, size=target_hw, mode="bilinear", align_corners=False
+                )
+            )
+            for w, s in weighted_scales
+        ]
+        grad_map = (
+            torch.stack(upsampled_scales, dim=0).sum(dim=0) / total_w
+        )  # Shape: (B, 1, H, W)
+        return (l1_map + grad_weight * grad_map) / (1.0 + grad_weight)  # Shape: (B, 1, H, W)
     return ((x_f32 - x_hat_f32) ** 2).mean(dim=1, keepdim=True)  # Shape: (B, 1, H, W)
+
+
+def _build_riad_disjoint_masks(
+    h: int,
+    w: int,
+    patch_size: int,
+    num_masks: int,
+    device: torch.device,
+    shift_hw: tuple[int, int] = (0, 0),
+) -> torch.Tensor:
+    """Build exact disjoint (M, 1, H, W) binary RIAD masks summing to 1.0 at every pixel."""
+    k = min(patch_size, max(2, min(h, w) // 2))
+    dy = shift_hw[0] % k
+    dx = shift_hw[1] % k
+    n_rows = math.ceil((h + k) / k)
+    n_cols = math.ceil((w + k) / k)
+
+    side = math.isqrt(num_masks)
+    if side * side == num_masks:
+        rows = torch.arange(n_rows, device=device).view(n_rows, 1)  # Shape: (n_rows, 1)
+        cols = torch.arange(n_cols, device=device).view(1, n_cols)  # Shape: (1, n_cols)
+        bucket = (rows % side) * side + (cols % side)  # Shape: (n_rows, n_cols)
+    else:
+        total_cells = n_rows * n_cols
+        perm_gen = torch.Generator(device="cpu").manual_seed(k * 1009 + num_masks)
+        perm = torch.randperm(total_cells, generator=perm_gen)  # Shape: (n_rows * n_cols,)
+        bucket = (
+            (perm % num_masks).view(n_rows, n_cols).to(device=device)
+        )  # Shape: (n_rows, n_cols)
+
+    pixel_buckets = (
+        bucket.repeat_interleave(k, dim=0)
+        .repeat_interleave(k, dim=1)[dy : dy + h, dx : dx + w]
+    )  # Shape: (H, W)
+    mask_ids = torch.arange(num_masks, device=device).view(num_masks, 1, 1)  # Shape: (M, 1, 1)
+    masks = (
+        (pixel_buckets.unsqueeze(0) == mask_ids).unsqueeze(1).to(torch.float32)
+    )  # Shape: (M, 1, H, W)
+    return masks
+
+
+def _riad_corrupt_batch(
+    x: torch.Tensor,
+    patch_sizes: tuple[int, ...],
+    num_masks: int,
+    prob: float,
+    seed: int,
+) -> torch.Tensor:
+    """Apply RIAD-style disjoint grid masking with per-image channel mean fill during fit()."""
+    # Shape: x is (B, C, H, W)
+    if prob <= 0.0 or len(patch_sizes) == 0 or x.numel() == 0:
+        return x
+
+    b, _, h, w = x.shape
+    x_noisy = x.clone()  # Shape: (B, C, H, W)
+    fill = x.mean(dim=(2, 3), keepdim=True)  # Shape: (B, C, 1, 1)
+    rng = random.Random(seed)
+    max_k = max(2, min(h, w) // 2)
+
+    for i in range(b):
+        if rng.random() >= prob:
+            continue
+        k = min(rng.choice(patch_sizes), max_k)
+        dy = rng.randrange(k)
+        dx = rng.randrange(k)
+        masks = _build_riad_disjoint_masks(
+            h,
+            w,
+            patch_size=k,
+            num_masks=num_masks,
+            device=x.device,
+            shift_hw=(dy, dx),
+        )  # Shape: (M, 1, H, W)
+        m = rng.randrange(num_masks)
+        mask_m = masks[m].to(dtype=x.dtype)  # Shape: (1, H, W)
+        x_noisy[i] = x[i] * (1.0 - mask_m) + fill[i] * mask_m  # Shape: (C, H, W)
+
+    return x_noisy  # Shape: (B, C, H, W)
 
 
 def _corrupt_batch(
@@ -489,15 +652,8 @@ def _guided_filter_2d(
     if radius <= 0:
         return src  # Shape: (B, 1, H, W)
 
-    guide_f32 = guide_rgb.float()  # Shape: (B, C_g, H_g, W_g)
+    guide = _to_luminance(guide_rgb)  # Shape: (B, 1, H_g, W_g)
     src_f32 = src.float()  # Shape: (B, 1, H, W)
-    if guide_f32.shape[1] == 3:
-        r = guide_f32[:, 0:1, :, :]  # Shape: (B, 1, H_g, W_g)
-        g = guide_f32[:, 1:2, :, :]  # Shape: (B, 1, H_g, W_g)
-        b_ch = guide_f32[:, 2:3, :, :]  # Shape: (B, 1, H_g, W_g)
-        guide = 0.299 * r + 0.587 * g + 0.114 * b_ch  # Shape: (B, 1, H_g, W_g)
-    else:
-        guide = guide_f32.mean(dim=1, keepdim=True)  # Shape: (B, 1, H_g, W_g)
 
     h, w = src_f32.shape[-2], src_f32.shape[-1]
     if guide.shape[-2:] != (h, w):
@@ -585,7 +741,12 @@ class RawAutoencoderModel:
 
         if config.loss_type not in _LOSS_FUNCTIONS:
             raise ValueError(f"Unsupported loss_type: {config.loss_type!r}")
-        self._loss_fn = _LOSS_FUNCTIONS[config.loss_type]
+        self._loss_fn: Any = (
+            functools.partial(_l1_grad_loss, grad_weight=config.grad_loss_weight)
+            if config.loss_type == "l1_grad"
+            else _LOSS_FUNCTIONS[config.loss_type]
+        )
+        self._riad_mask_cache: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
     def _build_network(self, in_channels: int, use_sigmoid: bool) -> Any:
         """Instantiate the underlying autoencoder network."""
@@ -733,6 +894,62 @@ class RawAutoencoderModel:
             batch_np = np.ascontiguousarray(train_images[idx_slice])  # Shape: (B, H, W, C)
             yield idx_slice, extractor.extract_batch(batch_np)
 
+    def _get_riad_masks(
+        self,
+        h: int,
+        w: int,
+        patch_size: int,
+        num_masks: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Fetch or build cached disjoint (M, 1, H, W) RIAD masks on device."""
+        key = (h, w, patch_size, num_masks)
+        cached = self._riad_mask_cache.get(key)
+        if cached is None or cached.device != device:
+            cached = _build_riad_disjoint_masks(
+                h, w, patch_size=patch_size, num_masks=num_masks, device=device, shift_hw=(0, 0)
+            )  # Shape: (M, 1, H, W)
+            self._riad_mask_cache[key] = cached
+        return cached
+
+    def _forward_riad_eval(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run multi-scale disjoint RIAD masked inpainting and average per-scale error maps."""
+        # Shape: x is (B, C, H, W)
+        h, w = x.shape[-2], x.shape[-1]
+        fill = x.mean(dim=(2, 3), keepdim=True)  # Shape: (B, C, 1, 1)
+        num_masks = self.config.riad_num_masks
+        scale_recons: list[torch.Tensor] = []
+        scale_err_maps: list[torch.Tensor] = []
+
+        for patch_size in self.config.riad_patch_sizes:
+            masks = self._get_riad_masks(
+                h, w, patch_size=patch_size, num_masks=num_masks, device=x.device
+            )  # Shape: (M, 1, H, W)
+            x_hat_scale = torch.zeros_like(x, dtype=torch.float32)  # Shape: (B, C, H, W)
+            for m in range(num_masks):
+                mask_m = masks[m : m + 1].to(dtype=x.dtype)  # Shape: (1, 1, H, W)
+                x_masked = x * (1.0 - mask_m) + fill * mask_m  # Shape: (B, C, H, W)
+                if self.device.type == "cuda":
+                    x_masked = x_masked.contiguous(memory_format=torch.channels_last)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self._use_amp):
+                    x_hat_m = self.net(x_masked)  # Shape: (B, C, H, W)
+                x_hat_scale = (
+                    x_hat_scale + x_hat_m.float() * mask_m.float()
+                )  # Shape: (B, C, H, W)
+
+            err_scale = _compute_raw_error_map(
+                x_hat_scale,
+                x,
+                self.config.loss_type,
+                grad_weight=self.config.grad_loss_weight,
+            )  # Shape: (B, 1, H, W)
+            scale_recons.append(x_hat_scale)
+            scale_err_maps.append(err_scale)
+
+        x_hat_mean = torch.stack(scale_recons, dim=0).mean(dim=0)  # Shape: (B, C, H, W)
+        err_map = torch.stack(scale_err_maps, dim=0).mean(dim=0)  # Shape: (B, 1, H, W)
+        return x_hat_mean, err_map
+
     def _score_batch_tensor(
         self,
         x: torch.Tensor,
@@ -741,13 +958,21 @@ class RawAutoencoderModel:
         guide_rgb: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute reconstruction (float32) and damped/calibrated error map (B, 1, H, W)."""
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self._use_amp):
-            x_hat = self.net(x)  # Shape: (B, C, H_in, W_in)
-        x_hat_f32 = x_hat.float()  # Shape: (B, C, H_in, W_in)
+        if len(self.config.riad_patch_sizes) > 0:
+            x_hat_f32, err_map = self._forward_riad_eval(
+                x
+            )  # Shape: (B, C, H_in, W_in), (B, 1, H_in, W_in)
+        else:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self._use_amp):
+                x_hat = self.net(x)  # Shape: (B, C, H_in, W_in)
+            x_hat_f32 = x_hat.float()  # Shape: (B, C, H_in, W_in)
 
-        err_map = _compute_raw_error_map(
-            x_hat_f32, x, self.config.loss_type
-        )  # Shape: (B, 1, H_in, W_in)
+            err_map = _compute_raw_error_map(
+                x_hat_f32,
+                x,
+                self.config.loss_type,
+                grad_weight=self.config.grad_loss_weight,
+            )  # Shape: (B, 1, H_in, W_in)
 
         # Apply texture variance damping only in [0, 1] pixel space (not ViT patch grids)
         if self.use_sigmoid and self.config.texture_damping > 0.0:
@@ -953,15 +1178,24 @@ class RawAutoencoderModel:
                     )
                 ):
                     optimizer.zero_grad(set_to_none=True)
-                    x_in = (
-                        _corrupt_batch(
-                            x,
-                            self.config.denoise_prob,
-                            seed=self.seed * 100003 + epoch * 1009 + step_idx,
-                        )
-                        if self.config.denoise_prob > 0.0
-                        else x
-                    )  # Shape: (B, C, H_in, W_in)
+                    if self.config.denoise_prob > 0.0:
+                        step_seed = self.seed * 100003 + epoch * 1009 + step_idx
+                        if len(self.config.riad_patch_sizes) > 0:
+                            x_in = _riad_corrupt_batch(
+                                x,
+                                patch_sizes=self.config.riad_patch_sizes,
+                                num_masks=self.config.riad_num_masks,
+                                prob=self.config.denoise_prob,
+                                seed=step_seed,
+                            )  # Shape: (B, C, H_in, W_in)
+                        else:
+                            x_in = _corrupt_batch(
+                                x,
+                                self.config.denoise_prob,
+                                seed=step_seed,
+                            )  # Shape: (B, C, H_in, W_in)
+                    else:
+                        x_in = x  # Shape: (B, C, H_in, W_in)
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self._use_amp):
                         x_hat = self.net(x_in)  # Shape: (B, C, H_in, W_in)
                         loss = self._loss_fn(x_hat, x)  # Shape: ()

@@ -193,6 +193,9 @@ def _serialize_hyperparams(config: PipelineConfig) -> dict[str, Any]:
         "loss_floor": ae.loss_floor,
         "guided_filter_radius": ae.guided_filter_radius,
         "guided_filter_eps": ae.guided_filter_eps,
+        "grad_loss_weight": ae.grad_loss_weight,
+        "riad_patch_sizes": list(ae.riad_patch_sizes),
+        "riad_num_masks": ae.riad_num_masks,
         "full_res": ds.full_res,
         "grayscale": ds.grayscale,
         "use_amp": ae.use_amp,
@@ -254,12 +257,20 @@ def _run_single_category(
         if config.model_name == "wta_ae"
         else ""
     )
+    grad_info = (
+        f", grad_weight={ae_cfg.grad_loss_weight:g}" if ae_cfg.loss_type == "l1_grad" else ""
+    )
+    riad_info = (
+        f", riad_patches={list(ae_cfg.riad_patch_sizes)}, riad_masks={ae_cfg.riad_num_masks}"
+        if ae_cfg.riad_patch_sizes
+        else ""
+    )
     print(
         f"Autoencoder ({config.model_name}) config: loss={ae_cfg.loss_type}, "
         f"stages={ae_cfg.num_stages}, base_ch={ae_cfg.base_channels}, "
         f"latent={ae_cfg.latent_dim}, dropout={ae_cfg.spatial_dropout:g}, "
         f"denoise={ae_cfg.denoise_prob:g}, texture_damping={ae_cfg.texture_damping:g}"
-        f"{wta_info}"
+        f"{grad_info}{riad_info}{wta_info}"
     )
 
     extractor = get_extractor(config, device)

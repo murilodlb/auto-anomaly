@@ -23,7 +23,7 @@ _NAME_HP_PATTERN = re.compile(
     r"(?:(?P<model>wta_ae|dcae)_)?"
     r"(?:(?P<res>fullres|\d+x\d+)_)?"
     r"(?:(?P<extractor>dinov3|raw)_)?"
-    r"(?P<loss>ms_l1_ssim|l1_ssim|l1ssim|smooth_l1|cosine|l1|l2)_"
+    r"(?P<loss>ms_l1_ssim|l1_ssim|l1ssim|l1_grad|smooth_l1|cosine|l1|l2)_"
     r"s(?P<stages>\d+)"
     r"(?:_c(?P<base_ch>\d+))?"
     r"(?:_z(?P<latent>\d+))?"
@@ -33,6 +33,7 @@ _NAME_HP_PATTERN = re.compile(
 _LOSS_ALIASES = {"l1ssim": "l1_ssim"}
 _NAME_GFR_PATTERN = re.compile(r"_gfr(?P<gfr>\d+)(?=_|-|$)")
 _NAME_DROP_PATTERN = re.compile(r"_drop(?P<drop>\d+(?:\.\d+)?)(?=_|-|$)")
+_NAME_RIAD_PATTERN = re.compile(r"_riad(?P<riad>\d+(?:-\d+)*)(?=_|$)")
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,8 @@ class ExperimentRecord:
     loss_floor: float | None
     guided_filter_radius: int | None
     guided_filter_eps: float | None
+    grad_loss_weight: float | None
+    riad_patch_sizes: str
     wta_spatial_window: int | None
     wta_lifetime_sparsity: float | None
     wta_train_density: float | None
@@ -251,7 +254,25 @@ def parse_experiment_name_hyperparams(name: str) -> dict[str, Any]:
     drop_match = _NAME_DROP_PATTERN.search(name)
     if drop_match is not None:
         parsed["spatial_dropout"] = float(drop_match.group("drop"))
+    riad_match = _NAME_RIAD_PATTERN.search(name)
+    if riad_match is not None:
+        parsed["riad_patch_sizes"] = riad_match.group("riad")
     return parsed
+
+
+def _format_riad_patch_sizes(val: Any) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, (list, tuple)):
+        parts = [
+            str(int(v))
+            for v in val
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        ]
+        return "-".join(parts)
+    return ""
 
 
 def _read_checkpoint_meta(weights_path: Path) -> dict[str, Any]:
@@ -528,6 +549,10 @@ def _build_record_from_run_dir(
         loss_floor=_safe_float(hp.get("loss_floor")) if "loss_floor" in hp else None,
         guided_filter_radius=_safe_int(hp.get("guided_filter_radius")),
         guided_filter_eps=_safe_opt_float(hp.get("guided_filter_eps")),
+        grad_loss_weight=_safe_opt_float(hp.get("grad_loss_weight")),
+        riad_patch_sizes=_format_riad_patch_sizes(
+            hp.get("riad_patch_sizes", parsed_name.get("riad_patch_sizes"))
+        ),
         wta_spatial_window=_safe_int(hp.get("wta_spatial_window")),
         wta_lifetime_sparsity=(
             _safe_float(hp.get("wta_lifetime_sparsity"))
@@ -637,6 +662,8 @@ def _build_incomplete_record(inv: FolderInventoryEntry) -> ExperimentRecord:
         loss_floor=None,
         guided_filter_radius=_safe_int(parsed.get("guided_filter_radius")),
         guided_filter_eps=None,
+        grad_loss_weight=None,
+        riad_patch_sizes=_format_riad_patch_sizes(parsed.get("riad_patch_sizes")),
         wta_spatial_window=None,
         wta_lifetime_sparsity=None,
         wta_train_density=None,

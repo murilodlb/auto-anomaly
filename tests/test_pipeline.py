@@ -36,14 +36,17 @@ from src.models import get_model
 from src.models.dcae import (
     ConvAutoencoder,
     RawAutoencoderModel,
+    _build_riad_disjoint_masks,
     _compute_raw_error_map,
     _corrupt_batch,
     _cosine_loss,
     _gms_map,
     _guided_filter_2d,
     _iter_msgms_error_scales,
+    _l1_grad_loss,
     _morphological_open_2d,
     _ms_l1_ssim_loss,
+    _riad_corrupt_batch,
     _ssim_map,
 )
 from src.models.wta_ae import WTAAutoencoderModel, WTAConvAutoencoder, WTASparsity2d
@@ -1749,3 +1752,212 @@ def test_dinov3_load_model_survives_broken_auto_image_processor(
     loaded_model, loaded_proc = extractor._load_model()
     assert loaded_model is mock_model
     assert loaded_proc is None
+
+
+def test_l1_grad_loss_luminance_edges_and_l1_unchanged() -> None:
+    torch.manual_seed(21)
+    x = torch.rand((2, 3, 32, 32), dtype=torch.float32)
+    assert float(_l1_grad_loss(x, x).item()) == pytest.approx(0.0, abs=1e-6)
+
+    # bfloat16 finiteness
+    bf_a = torch.rand((2, 3, 32, 32), dtype=torch.bfloat16)
+    bf_b = torch.rand((2, 3, 32, 32), dtype=torch.bfloat16)
+    assert torch.isfinite(_l1_grad_loss(bf_a, bf_b))
+    grad_bf_err = _compute_raw_error_map(bf_a, bf_b, "l1_grad")
+    assert grad_bf_err.dtype == torch.float32
+    assert torch.isfinite(grad_bf_err).all()
+
+    # Low-contrast structural scratch: small RGB amplitude but sharp edge discontinuity
+    bg = torch.full((1, 3, 64, 64), 0.5, dtype=torch.float32)
+    orig = bg.clone()
+    orig[:, :, 31:33, 16:48] = 0.58
+    l1_only = _compute_raw_error_map(bg, orig, "l1")
+    l1_expected = (orig.float() - bg.float()).abs().mean(dim=1, keepdim=True)
+    assert torch.allclose(l1_only, l1_expected, atol=1e-7)
+
+    l1_grad_err = _compute_raw_error_map(bg, orig, "l1_grad", grad_weight=2.0)
+    assert l1_grad_err.shape == (1, 1, 64, 64)
+    edge_peak = float(l1_grad_err[:, :, 29:35, 16:48].max().item())
+    bg_corner = float(l1_grad_err[:, :, :10, :10].mean().item())
+    assert edge_peak > 0.04
+    assert bg_corner == pytest.approx(0.0, abs=1e-6)
+    # Directional gradient halo detects adjacent boundary pixels where L1 is zero
+    assert float(l1_grad_err[:, :, 30, 24].item()) > 0.01
+    assert float(l1_only[:, :, 30, 24].item()) == pytest.approx(0.0, abs=1e-6)
+
+    # Edge-orientation flip (same pixel values histogram, inverted gradient sign)
+    step_a = torch.full((1, 3, 32, 32), 0.45, dtype=torch.float32)
+    step_a[:, :, :, 16:] = 0.55
+    step_b = torch.full((1, 3, 32, 32), 0.55, dtype=torch.float32)
+    step_b[:, :, :, 16:] = 0.45
+    assert float(_l1_grad_loss(step_a, step_b, grad_weight=2.0).item()) > float(
+        torch.nn.functional.l1_loss(step_a, step_b).item() * 0.35
+    )
+
+
+def test_riad_disjoint_masks_exact_partition_and_non_divisible_shapes() -> None:
+    device = torch.device("cpu")
+    for h, w in ((64, 64), (67, 71)):
+        for patch_size in (8, 16):
+            for num_masks in (3, 4, 9):
+                for shift in ((0, 0), (3, 5)):
+                    masks = _build_riad_disjoint_masks(
+                        h,
+                        w,
+                        patch_size=patch_size,
+                        num_masks=num_masks,
+                        device=device,
+                        shift_hw=shift,
+                    )
+                    assert masks.shape == (num_masks, 1, h, w)
+                    assert masks.dtype == torch.float32
+                    unique_vals = torch.unique(masks)
+                    assert all(float(v) in (0.0, 1.0) for v in unique_vals)
+                    assert torch.all(masks.sum(dim=0) == 1.0)
+
+    # M=4 strided tiling guarantees all 4 cardinal neighbors of masked cell are unmasked
+    masks_4 = _build_riad_disjoint_masks(
+        64, 64, patch_size=8, num_masks=4, device=device, shift_hw=(0, 0)
+    )
+    for m_idx in range(4):
+        cell_grid = masks_4[m_idx, 0, ::8, ::8]  # Shape: (8, 8) coarse cells
+        for r in range(1, 7):
+            for c in range(1, 7):
+                if float(cell_grid[r, c].item()) == 1.0:
+                    assert float(cell_grid[r - 1, c].item()) == 0.0
+                    assert float(cell_grid[r + 1, c].item()) == 0.0
+                    assert float(cell_grid[r, c - 1].item()) == 0.0
+                    assert float(cell_grid[r, c + 1].item()) == 0.0
+
+
+def test_riad_cannot_copy_input_defect_and_e2e_pipeline(tmp_path: Path) -> None:
+    class _IdentityNet(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.use_sigmoid = True
+            self.register_buffer("calibrated", torch.zeros(1, dtype=torch.bool))
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x
+
+    device = torch.device("cpu")
+    riad_cfg = AutoencoderConfig(
+        latent_dim=8,
+        base_channels=8,
+        num_stages=2,
+        loss_type="l1_grad",
+        grad_loss_weight=2.0,
+        riad_patch_sizes=(16,),
+        riad_num_masks=4,
+    )
+    id_model = RawAutoencoderModel(3, riad_cfg, device=device, batch_size=1)
+    id_model.net = _IdentityNet()
+
+    x = torch.full((1, 3, 64, 64), 0.2, dtype=torch.float32)
+    x[:, :, 16:32, 16:32] = 0.95
+    expected_fill = x.mean(dim=(2, 3), keepdim=True).expand(1, 3, 16, 16)
+    with torch.inference_mode():
+        recon, err = id_model._forward_riad_eval(x)
+    assert torch.allclose(recon[:, :, 16:32, 16:32], expected_fill, atol=1e-6)
+    assert float(err[:, :, 16:32, 16:32].mean().item()) > 0.3
+
+    # CLI flags and validation
+    data_root = _create_synthetic_mvtec(tmp_path / "data")
+    args = build_parser().parse_args(
+        [
+            "--data-dir",
+            str(data_root),
+            "--loss",
+            "l1_grad",
+            "--grad-loss-weight",
+            "2.5",
+            "--riad-patch-sizes",
+            "8",
+            "16",
+            "--riad-num-masks",
+            "4",
+            "--device",
+            "cpu",
+        ]
+    )
+    cfg_cli = PipelineConfig.from_args(**vars(args))
+    cfg_cli.validate()
+    assert cfg_cli.autoencoder.loss_type == "l1_grad"
+    assert cfg_cli.autoencoder.grad_loss_weight == pytest.approx(2.5)
+    assert cfg_cli.autoencoder.riad_patch_sizes == (8, 16)
+    assert cfg_cli.autoencoder.riad_num_masks == 4
+
+    for bad_ae in (
+        AutoencoderConfig(grad_loss_weight=-0.1),
+        AutoencoderConfig(riad_num_masks=1),
+        AutoencoderConfig(riad_patch_sizes=(1,)),
+    ):
+        with pytest.raises(ValueError):
+            PipelineConfig(
+                dataset=DatasetConfig(root_dir=data_root),
+                autoencoder=bad_ae,
+                device="cpu",
+            ).validate()
+
+    with pytest.raises(ValueError, match="extractor='raw'"):
+        PipelineConfig(
+            dataset=DatasetConfig(root_dir=data_root, image_size=(256, 256)),
+            extractor_name="dinov3",
+            autoencoder=AutoencoderConfig(num_stages=3, riad_patch_sizes=(8,)),
+            device="cpu",
+        ).validate()
+
+    # Deterministic _riad_corrupt_batch
+    corrupt_a = _riad_corrupt_batch(x, (16,), num_masks=4, prob=1.0, seed=99)
+    corrupt_b = _riad_corrupt_batch(x, (16,), num_masks=4, prob=1.0, seed=99)
+    assert torch.equal(corrupt_a, corrupt_b)
+
+    # End-to-end smoke run with l1_grad + multi-scale RIAD
+    out_base = tmp_path / "results"
+    exp_name = "carpet_dcae_fullres_l1_grad_s3_c8_z16_ep4_drop0.0_gfr4_riad8-16"
+    e2e_cfg = PipelineConfig(
+        dataset=DatasetConfig(root_dir=data_root, image_size=(64, 64), batch_size=2, num_workers=1),
+        model_name="dcae",
+        autoencoder=AutoencoderConfig(
+            latent_dim=16,
+            base_channels=8,
+            num_stages=3,
+            loss_type="l1_grad",
+            grad_loss_weight=2.0,
+            epochs=4,
+            gaussian_sigma=1.0,
+            spatial_dropout=0.0,
+            denoise_prob=1.0,
+            texture_damping=0.0,
+            guided_filter_radius=4,
+            riad_patch_sizes=(8, 16),
+            riad_num_masks=4,
+        ),
+        output=OutputConfig(
+            base_dir=out_base,
+            experiment_name=exp_name,
+            save_visualizations=False,
+        ),
+        device="cpu",
+    )
+    payload = run_pipeline(e2e_cfg)
+    losses = payload["epoch_losses"]
+    assert len(losses) == 4
+    assert losses[-1] < losses[0]
+    assert payload["calibration"]["calibrated"] is True
+
+    saved = json.loads((out_base / exp_name / "metrics.json").read_text(encoding="utf-8"))
+    assert saved["hyperparams"]["loss_type"] == "l1_grad"
+    assert saved["hyperparams"]["grad_loss_weight"] == pytest.approx(2.0)
+    assert saved["hyperparams"]["riad_patch_sizes"] == [8, 16]
+    assert saved["hyperparams"]["riad_num_masks"] == 4
+
+    parsed = parse_experiment_name_hyperparams(exp_name)
+    assert parsed["loss_type"] == "l1_grad"
+    assert parsed["riad_patch_sizes"] == "8-16"
+
+    _, records, _ = scan_results(out_base)
+    assert len(records) == 1
+    assert records[0].loss_type == "l1_grad"
+    assert records[0].grad_loss_weight == pytest.approx(2.0)
+    assert records[0].riad_patch_sizes == "8-16"

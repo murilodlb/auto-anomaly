@@ -8,7 +8,9 @@ from typing import Any
 
 import cv2
 
-VALID_LOSS_TYPES = frozenset({"l1", "l2", "smooth_l1", "l1_ssim", "ms_l1_ssim", "cosine"})
+VALID_LOSS_TYPES = frozenset(
+    {"l1", "l2", "smooth_l1", "l1_ssim", "ms_l1_ssim", "l1_grad", "cosine"}
+)
 VALID_EXTRACTORS = frozenset({"raw", "dinov3"})
 VALID_MODELS = frozenset({"dcae", "wta_ae", "autoencoder"})
 MVTEC_CATEGORIES: tuple[str, ...] = (
@@ -139,6 +141,9 @@ class AutoencoderConfig:
     loss_floor: float = 0.006
     guided_filter_radius: int = 8
     guided_filter_eps: float = 0.01
+    grad_loss_weight: float = 2.0
+    riad_patch_sizes: tuple[int, ...] = ()
+    riad_num_masks: int = 4
     use_amp: bool = True
     save_weights: bool = True
     load_weights: Path | None = None
@@ -323,6 +328,14 @@ class PipelineConfig:
             )
         if ae.guided_filter_eps <= 0.0:
             raise ValueError(f"guided_filter_eps must be > 0.0, got {ae.guided_filter_eps}")
+        if ae.grad_loss_weight < 0.0:
+            raise ValueError(f"grad_loss_weight must be >= 0.0, got {ae.grad_loss_weight}")
+        if ae.riad_num_masks < 2:
+            raise ValueError(f"riad_num_masks must be >= 2, got {ae.riad_num_masks}")
+        if any(p < 2 for p in ae.riad_patch_sizes):
+            raise ValueError(f"All riad_patch_sizes must be >= 2, got {ae.riad_patch_sizes}")
+        if ae.riad_patch_sizes and self.extractor_name != "raw":
+            raise ValueError("RIAD spatial grid masking is only supported with extractor='raw'")
         if ae.load_weights is not None and not ae.load_weights.is_file():
             raise FileNotFoundError(f"Checkpoint file does not exist: {ae.load_weights}")
 
@@ -385,6 +398,10 @@ class PipelineConfig:
 
         load_weights_raw = kwargs.get("load_weights")
         load_weights = Path(load_weights_raw) if load_weights_raw is not None else None
+        riad_patches_raw = kwargs.get("riad_patch_sizes")
+        riad_patch_sizes = (
+            tuple(int(v) for v in riad_patches_raw) if riad_patches_raw else ()
+        )
 
         ae_cfg = AutoencoderConfig(
             latent_dim=int(kwargs.get("latent_dim", 128)),
@@ -402,6 +419,9 @@ class PipelineConfig:
             loss_floor=float(kwargs.get("loss_floor", 0.006)),
             guided_filter_radius=int(kwargs.get("guided_filter_radius", 8)),
             guided_filter_eps=float(kwargs.get("guided_filter_eps", 0.01)),
+            grad_loss_weight=float(kwargs.get("grad_loss_weight", 2.0)),
+            riad_patch_sizes=riad_patch_sizes,
+            riad_num_masks=int(kwargs.get("riad_num_masks", 4)),
             use_amp=not bool(kwargs.get("no_amp", False)),
             save_weights=not bool(kwargs.get("no_save_weights", False)),
             load_weights=load_weights,

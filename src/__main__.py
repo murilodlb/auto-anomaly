@@ -156,6 +156,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fast Guided Filter regularization epsilon (> 0)",
     )
     parser.add_argument(
+        "--grad-loss-weight",
+        type=float,
+        default=2.0,
+        help="Weight of multi-scale luminance Sobel gradient L1 term in l1_grad loss",
+    )
+    parser.add_argument(
+        "--riad-patch-sizes",
+        nargs="*",
+        type=int,
+        default=None,
+        help=(
+            "Multi-scale RIAD disjoint grid mask sizes in pixels (e.g. 32 64 128); "
+            "omit or pass empty to disable"
+        ),
+    )
+    parser.add_argument(
+        "--riad-num-masks",
+        type=int,
+        default=4,
+        help="Number of disjoint RIAD masks per patch scale (>= 2)",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="results",
