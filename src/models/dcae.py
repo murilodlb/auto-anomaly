@@ -710,6 +710,18 @@ def _uint8_nhwc_to_unit_nchw(batch_images: np.ndarray, device: torch.device) -> 
     return tensor_u8.permute(0, 3, 1, 2).to(dtype=torch.float32).div_(255.0)  # Shape: (B, C, H, W)
 
 
+def _resolve_amp_settings(use_amp: bool, device: torch.device) -> tuple[bool, torch.dtype]:
+    """Select hardware-native AMP enabled flag and dtype (bf16 >= sm_80, fp16 sm_7x, else fp32)."""
+    if not use_amp or device.type != "cuda":
+        return False, torch.float32
+    major, _ = torch.cuda.get_device_capability(device)
+    if major >= 8 and torch.cuda.is_bf16_supported(including_emulation=False):
+        return True, torch.bfloat16
+    if major >= 7:
+        return True, torch.float16
+    return False, torch.float32
+
+
 class RawAutoencoderModel:
     """Training, inference, and anomaly-map scoring wrapper around ConvAutoencoder."""
 
@@ -735,9 +747,7 @@ class RawAutoencoderModel:
         if device.type == "cuda":
             self.net.to(memory_format=torch.channels_last)
 
-        self._use_amp = bool(
-            config.use_amp and device.type == "cuda" and torch.cuda.is_bf16_supported()
-        )
+        self._use_amp, self._amp_dtype = _resolve_amp_settings(config.use_amp, device)
 
         if config.loss_type not in _LOSS_FUNCTIONS:
             raise ValueError(f"Unsupported loss_type: {config.loss_type!r}")
@@ -793,7 +803,7 @@ class RawAutoencoderModel:
         if not getattr(extractor, "cache_features_for_training", False) or len(train_images) == 0:
             return None
 
-        cache_dtype = torch.bfloat16 if self._use_amp else torch.float32
+        cache_dtype = self._amp_dtype if self._use_amp else torch.float32
         chunks: list[torch.Tensor] = []
         num_samples = len(train_images)
         with torch.inference_mode():
@@ -931,7 +941,7 @@ class RawAutoencoderModel:
                 x_masked = x * (1.0 - mask_m) + fill * mask_m  # Shape: (B, C, H, W)
                 if self.device.type == "cuda":
                     x_masked = x_masked.contiguous(memory_format=torch.channels_last)
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self._use_amp):
+                with torch.amp.autocast("cuda", dtype=self._amp_dtype, enabled=self._use_amp):
                     x_hat_m = self.net(x_masked)  # Shape: (B, C, H, W)
                 x_hat_scale = (
                     x_hat_scale + x_hat_m.float() * mask_m.float()
@@ -963,7 +973,7 @@ class RawAutoencoderModel:
                 x
             )  # Shape: (B, C, H_in, W_in), (B, 1, H_in, W_in)
         else:
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self._use_amp):
+            with torch.amp.autocast("cuda", dtype=self._amp_dtype, enabled=self._use_amp):
                 x_hat = self.net(x)  # Shape: (B, C, H_in, W_in)
             x_hat_f32 = x_hat.float()  # Shape: (B, C, H_in, W_in)
 
@@ -1139,12 +1149,14 @@ class RawAutoencoderModel:
                 "early stopping may trigger at epoch 21. Consider --loss cosine or --loss-floor 0.",
                 flush=True,
             )
-
         optimizer = torch.optim.AdamW(
             self.net.parameters(),
             lr=self.config.lr,
             weight_decay=self.config.weight_decay,
         )
+        use_scaler = self._use_amp and self._amp_dtype == torch.float16
+        scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=self.config.epochs,
@@ -1166,6 +1178,7 @@ class RawAutoencoderModel:
                 self.net.train()
                 t0 = time.perf_counter()
                 running_loss = torch.zeros((), dtype=torch.float64, device=self.device)
+                optimizer_stepped = False
 
                 for step_idx, (_idx_slice, x) in enumerate(
                     self._iter_train_batches(
@@ -1196,14 +1209,23 @@ class RawAutoencoderModel:
                             )  # Shape: (B, C, H_in, W_in)
                     else:
                         x_in = x  # Shape: (B, C, H_in, W_in)
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self._use_amp):
+                    with torch.amp.autocast("cuda", dtype=self._amp_dtype, enabled=self._use_amp):
                         x_hat = self.net(x_in)  # Shape: (B, C, H_in, W_in)
                         loss = self._loss_fn(x_hat, x)  # Shape: ()
-                    loss.backward()
-                    optimizer.step()
+                    if use_scaler:
+                        scale_before = scaler.get_scale()
+                        scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+                        if scaler.get_scale() >= scale_before:
+                            optimizer_stepped = True
+                    else:
+                        loss.backward()
+                        optimizer.step()
                     running_loss += loss.detach().to(torch.float64) * x.shape[0]
 
-                scheduler.step()
+                if not use_scaler or optimizer_stepped:
+                    scheduler.step()
                 avg_loss = float(running_loss.item()) / max(1, num_samples)
                 epoch_losses.append(avg_loss)
                 elapsed = time.perf_counter() - t0

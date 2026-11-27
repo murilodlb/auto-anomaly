@@ -46,6 +46,7 @@ from src.models.dcae import (
     _l1_grad_loss,
     _morphological_open_2d,
     _ms_l1_ssim_loss,
+    _resolve_amp_settings,
     _riad_corrupt_batch,
     _ssim_map,
 )
@@ -1961,3 +1962,27 @@ def test_riad_cannot_copy_input_defect_and_e2e_pipeline(tmp_path: Path) -> None:
     assert records[0].loss_type == "l1_grad"
     assert records[0].grad_loss_weight == pytest.approx(2.0)
     assert records[0].riad_patch_sizes == "8-16"
+
+
+def test_resolve_amp_settings_by_gpu_capability(monkeypatch: pytest.MonkeyPatch) -> None:
+    # CPU or disabled AMP always uses float32
+    assert _resolve_amp_settings(True, torch.device("cpu")) == (False, torch.float32)
+    assert _resolve_amp_settings(False, torch.device("cuda", 0)) == (False, torch.float32)
+
+    # Ampere/Hopper (sm_80+) with native bf16 selects bfloat16
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _d: (8, 0))
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda including_emulation=True: True)
+    assert _resolve_amp_settings(True, torch.device("cuda", 0)) == (True, torch.bfloat16)
+
+    # Turing/Volta (sm_75) without native bf16 selects float16 even if emulated bf16 is True
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _d: (7, 5))
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_bf16_supported",
+        lambda including_emulation=True: including_emulation,
+    )
+    assert _resolve_amp_settings(True, torch.device("cuda", 0)) == (True, torch.float16)
+
+    # Pascal (sm_61) disables AMP cleanly
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _d: (6, 1))
+    assert _resolve_amp_settings(True, torch.device("cuda", 0)) == (False, torch.float32)
