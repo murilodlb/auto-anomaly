@@ -12,6 +12,83 @@ import numpy as np
 
 from src.config import DatasetConfig
 
+# Official MVTec AD counts per category: (train_good, test_total, test_defective)
+EXPECTED_MVTEC_COUNTS: dict[str, tuple[int, int, int]] = {
+    "bottle": (209, 83, 63),
+    "cable": (224, 150, 92),
+    "capsule": (219, 132, 109),
+    "carpet": (280, 117, 89),
+    "grid": (264, 78, 57),
+    "hazelnut": (391, 110, 70),
+    "leather": (245, 124, 92),
+    "metal_nut": (220, 115, 93),
+    "pill": (267, 167, 141),
+    "screw": (320, 160, 119),
+    "tile": (230, 117, 84),
+    "toothbrush": (60, 42, 30),
+    "transistor": (213, 100, 40),
+    "wood": (247, 79, 60),
+    "zipper": (240, 151, 119),
+}
+
+
+def _check_mvtec_split_sanity(
+    category: str,
+    train_paths: Sequence[Path],
+    test_records: Sequence[tuple[Path, Path | None, int, str]],
+) -> list[str]:
+    """Warn if an MVTec AD category has unexpected image counts or numbering gaps."""
+    warnings_out: list[str] = []
+    n_train = len(train_paths)
+    n_test = len(test_records)
+    n_defective = sum(1 for rec in test_records if rec[2] == 1)
+
+    expected = EXPECTED_MVTEC_COUNTS.get(category)
+    if expected is not None and (n_train, n_test, n_defective) != expected:
+        exp_tr, exp_te, exp_def = expected
+        swapped_matches = [
+            other
+            for other, counts in EXPECTED_MVTEC_COUNTS.items()
+            if other != category and counts == (n_train, n_test, n_defective)
+        ]
+        swap_hint = (
+            f" — counts match category '{swapped_matches[0]}' (possible swapped directory!)"
+            if swapped_matches
+            else " — check for incomplete extraction/transfer."
+        )
+        msg = (
+            f"[WARN] Dataset sanity check failed for MVTec AD category '{category}': "
+            f"found train={n_train}, test={n_test}, gt={n_defective}; "
+            f"expected train={exp_tr}, test={exp_te}, gt={exp_def}{swap_hint}"
+        )
+        warnings_out.append(msg)
+
+    if train_paths and all(p.stem.isdigit() for p in train_paths):
+        indices = sorted(int(p.stem) for p in train_paths)
+        max_idx = indices[-1]
+        missing = sorted(set(range(0, max_idx + 1)) - set(indices))
+        if missing:
+            first_start = missing[0]
+            first_end = first_start
+            for val in missing[1:]:
+                if val == first_end + 1:
+                    first_end = val
+                else:
+                    break
+            range_str = (
+                f"{first_start}..{first_end}" if first_end > first_start else f"{first_start}"
+            )
+            msg = (
+                f"[WARN] Non-contiguous training filenames in '{category}/train/good': "
+                f"missing {len(missing)} index(es) in 0..{max_idx} "
+                f"(first gap: {range_str})."
+            )
+            warnings_out.append(msg)
+
+    for msg in warnings_out:
+        print(msg)
+    return warnings_out
+
 
 @dataclass(slots=True)
 class MVTecSplit:
@@ -137,6 +214,8 @@ def load_mvtec_category(config: DatasetConfig) -> tuple[MVTecSplit, MVTecSplit]:
 
     if not test_records:
         raise ValueError(f"No test images found in {config.test_dir}")
+
+    _check_mvtec_split_sanity(config.category, train_paths, test_records)
 
     return _load_split(train_records, config), _load_split(test_records, config)
 

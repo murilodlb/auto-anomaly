@@ -2248,3 +2248,39 @@ def test_legacy_16x16_checkpoint_loads_and_recalibrates(
                 autoencoder=bad_ae,
                 device="cpu",
             ).validate()
+
+
+def test_mvtec_dataset_sanity_check_warns_on_gaps_and_swapped_categories(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from src.dataset import EXPECTED_MVTEC_COUNTS, _check_mvtec_split_sanity
+
+    # 1. Exact official counts for carpet (000..279) produce zero warnings
+    full_train = [Path(f"{i:03d}.png") for i in range(280)]
+    full_test = [(Path(f"good_{i:03d}.png"), None, 0, "good") for i in range(28)] + [
+        (Path(f"def_{i:03d}.png"), Path(f"def_{i:03d}_mask.png"), 1, "hole") for i in range(89)
+    ]
+    assert _check_mvtec_split_sanity("carpet", full_train, full_test) == []
+    assert capsys.readouterr().out == ""
+
+    # 2. Truncated carpet with numbering gap (000..030 + 130..174 = 76) warns on both count & gap
+    truncated_train = [Path(f"{i:03d}.png") for i in list(range(31)) + list(range(130, 175))]
+    warns_trunc = _check_mvtec_split_sanity("carpet", truncated_train, full_test)
+    out_trunc = capsys.readouterr().out
+    assert len(warns_trunc) == 2
+    assert "found train=76" in out_trunc
+    assert "expected train=280" in out_trunc
+    assert "missing 99 index(es) in 0..174 (first gap: 31..129)" in out_trunc
+
+    # 3. Swapped directory: carpet's (280, 117, 89) inside 'cable' flags possible swap with 'carpet'
+    warns_swap = _check_mvtec_split_sanity("cable", full_train, full_test)
+    out_swap = capsys.readouterr().out
+    assert len(warns_swap) == 1
+    assert "expected train=224, test=150, gt=92" in out_swap
+    assert "match category 'carpet'" in out_swap
+
+    # 4. Official totals match MVTec AD specification (3629 train, 1725 test, 1258 defective)
+    assert len(EXPECTED_MVTEC_COUNTS) == 15
+    assert sum(v[0] for v in EXPECTED_MVTEC_COUNTS.values()) == 3629
+    assert sum(v[1] for v in EXPECTED_MVTEC_COUNTS.values()) == 1725
+    assert sum(v[2] for v in EXPECTED_MVTEC_COUNTS.values()) == 1258
