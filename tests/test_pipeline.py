@@ -717,8 +717,18 @@ def test_ms_l1_ssim_denoising_training_and_calibration() -> None:
     assert torch.isfinite(model.net.err_mean).all()
     assert float(model.net.err_std.item()) >= 1e-4
     assert float(model.net.err_p99.item()) >= float(model.net.err_mean.item())
-    assert model.net.normal_mu_map.shape == (1, 1, 16, 16)
-    assert model.net.normal_std_map.shape == (1, 1, 16, 16)
+    assert model.net.normal_mu_map.shape == (
+        1,
+        1,
+        cfg.calib_spatial_size,
+        cfg.calib_spatial_size,
+    )
+    assert model.net.normal_std_map.shape == (
+        1,
+        1,
+        cfg.calib_spatial_size,
+        cfg.calib_spatial_size,
+    )
     assert any(isinstance(m, torch.nn.InstanceNorm2d) for m in model.net.encoder)
 
     # Multi-seed corruption covers all modes (including smooth Gaussian blob stain) within bounds
@@ -1986,3 +1996,255 @@ def test_resolve_amp_settings_by_gpu_capability(monkeypatch: pytest.MonkeyPatch)
     # Pascal (sm_61) disables AMP cleanly
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _d: (6, 1))
     assert _resolve_amp_settings(True, torch.device("cuda", 0)) == (False, torch.float32)
+
+
+def test_peak_channel_l1_boosts_hue_swap_over_mean_l1() -> None:
+    # 1-channel hue difference: mean=0.10, max=0.30 -> 50/50 blend gives 0.20 (2x boost)
+    x_hue = torch.zeros((1, 3, 8, 8), dtype=torch.float32)
+    x_hat_hue = torch.zeros((1, 3, 8, 8), dtype=torch.float32)
+    x_hat_hue[:, 2, :, :] = 0.30
+
+    err_mean_only = _compute_raw_error_map(x_hat_hue, x_hue, "l1")
+    err_peak_blend = _compute_raw_error_map(x_hat_hue, x_hue, "l1", channel_max_weight=0.5)
+    assert float(err_mean_only.mean().item()) == pytest.approx(0.10, abs=1e-6)
+    assert float(err_peak_blend.mean().item()) == pytest.approx(0.20, abs=1e-6)
+
+    # Achromatic white glare (equal across RGB): peak blend equals channel-mean (0.60)
+    x_glare = torch.zeros((1, 3, 8, 8), dtype=torch.float32)
+    x_hat_glare = torch.full((1, 3, 8, 8), 0.60, dtype=torch.float32)
+    assert float(
+        _compute_raw_error_map(x_hat_glare, x_glare, "l1", channel_max_weight=0.5).mean().item()
+    ) == pytest.approx(0.60, abs=1e-6)
+
+    # Grayscale (1-channel) tensors are unaffected by channel_max_weight
+    x_gray = torch.zeros((1, 1, 8, 8), dtype=torch.float32)
+    x_hat_gray = torch.full((1, 1, 8, 8), 0.25, dtype=torch.float32)
+    assert float(
+        _compute_raw_error_map(x_hat_gray, x_gray, "l1", channel_max_weight=0.5).mean().item()
+    ) == pytest.approx(0.25, abs=1e-6)
+
+
+def test_spatial_calibration_64x64_suppresses_local_high_variance_glare() -> None:
+    class _FixedReconNet(torch.nn.Module):
+        def __init__(self, spatial_size: int) -> None:
+            super().__init__()
+            self.use_sigmoid = True
+            self.register_buffer("err_mean", torch.zeros(1, dtype=torch.float32))
+            self.register_buffer("err_std", torch.ones(1, dtype=torch.float32))
+            self.register_buffer("err_p99", torch.zeros(1, dtype=torch.float32))
+            self.register_buffer("calibrated", torch.zeros(1, dtype=torch.bool))
+            self.register_buffer(
+                "normal_mu_map",
+                torch.zeros((1, 1, spatial_size, spatial_size), dtype=torch.float32),
+            )
+            self.register_buffer(
+                "normal_std_map",
+                torch.ones((1, 1, spatial_size, spatial_size), dtype=torch.float32),
+            )
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # Reconstruct zeros so error amplitude directly equals input pixel values
+            return torch.zeros_like(x)
+
+    device = torch.device("cpu")
+    n_train = 8
+    # Train split: top-left quadrant has high glare variance across images (0.0 .. 0.30),
+    # bottom-right quadrant (smooth cable jacket) is tightly constant (~0.01)
+    train_u8 = np.full((n_train, 64, 64, 3), 3, dtype=np.uint8)
+    glare_vals = np.linspace(0, 80, n_train, dtype=np.uint8)
+    for i, v in enumerate(glare_vals):
+        train_u8[i, :16, :16, :] = v
+
+    ext = RawPixelExtractor(DatasetConfig(image_size=(64, 64)), RawExtractorConfig(), device)
+
+    # New settings: 64x64 grid, 85/15 spatial/global blend, z_shift=0.5
+    cfg_new = AutoencoderConfig(
+        latent_dim=8,
+        base_channels=8,
+        num_stages=2,
+        loss_type="l1",
+        l1_channel_max_weight=0.5,
+        calib_spatial_size=64,
+        calib_spatial_weight=0.85,
+        calib_z_shift=0.5,
+        texture_damping=0.0,
+        gaussian_sigma=0.0,
+        guided_filter_radius=0,
+    )
+    m_new = RawAutoencoderModel(3, cfg_new, device=device, batch_size=4)
+    m_new.net = _FixedReconNet(spatial_size=64)
+    m_new.calibrate(train_u8, ext)
+
+    # Probe tensor: moderate error (0.055) on smooth jacket vs large glare error (0.28) in top-left
+    probe = torch.zeros((1, 3, 64, 64), dtype=torch.float32)
+    probe[:, :, 48:, 48:] = 0.055
+    probe[:, :, :16, :16] = 0.28
+    with torch.inference_mode():
+        _, score_new = m_new._score_batch_tensor(probe, target_hw=(64, 64), apply_calibration=True)
+    smooth_new = float(score_new[0, 0, 52:60, 52:60].mean().item())
+    glare_new = float(score_new[0, 0, 4:12, 4:12].mean().item())
+    assert smooth_new > glare_new
+
+    # Legacy settings (50/50 blend, z_shift=1.5) allow global std to dilute the smooth jacket
+    cfg_old = AutoencoderConfig(
+        latent_dim=8,
+        base_channels=8,
+        num_stages=2,
+        loss_type="l1",
+        l1_channel_max_weight=0.0,
+        calib_spatial_size=16,
+        calib_spatial_weight=0.5,
+        calib_z_shift=1.5,
+        texture_damping=0.0,
+        gaussian_sigma=0.0,
+        guided_filter_radius=0,
+    )
+    m_old = RawAutoencoderModel(3, cfg_old, device=device, batch_size=4)
+    m_old.net = _FixedReconNet(spatial_size=16)
+    m_old.calibrate(train_u8, ext)
+    with torch.inference_mode():
+        _, score_old = m_old._score_batch_tensor(probe, target_hw=(64, 64), apply_calibration=True)
+    smooth_old = float(score_old[0, 0, 52:60, 52:60].mean().item())
+    glare_old = float(score_old[0, 0, 4:12, 4:12].mean().item())
+    assert glare_old >= smooth_old
+
+
+def test_legacy_16x16_checkpoint_loads_and_recalibrates(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_root = _create_synthetic_mvtec(tmp_path / "data")
+    out_base = tmp_path / "results"
+
+    # Train and save a checkpoint with 16x16 calibration buffers and legacy scoring settings
+    train_cfg = PipelineConfig(
+        dataset=DatasetConfig(root_dir=data_root, image_size=(64, 64), batch_size=2, num_workers=1),
+        autoencoder=AutoencoderConfig(
+            latent_dim=16,
+            base_channels=8,
+            num_stages=3,
+            loss_type="l1",
+            epochs=2,
+            gaussian_sigma=1.0,
+            l1_channel_max_weight=0.0,
+            calib_spatial_size=16,
+            calib_spatial_weight=0.5,
+            calib_z_shift=1.5,
+        ),
+        output=OutputConfig(
+            base_dir=out_base,
+            experiment_name="train_16",
+            save_visualizations=False,
+        ),
+        device="cpu",
+    )
+    run_pipeline(train_cfg)
+    ckpt_16 = out_base / "train_16" / "weights" / "model.pt"
+    assert ckpt_16.is_file()
+
+    # Craft a strict legacy copy whose meta lacks new scoring keys
+    legacy_ckpt = tmp_path / "legacy_model.pt"
+    raw_ckpt = torch.load(ckpt_16, map_location="cpu", weights_only=True)
+    for k in (
+        "calib_spatial_size",
+        "l1_channel_max_weight",
+        "calib_spatial_weight",
+        "calib_z_shift",
+    ):
+        raw_ckpt["meta"].pop(k, None)
+    torch.save(raw_ckpt, legacy_ckpt)
+
+    # 1) Load legacy 16x16 checkpoint into 64x64 model WITHOUT recalibrate -> resizes & warns
+    capsys.readouterr()
+    reload_only_cfg = PipelineConfig(
+        dataset=train_cfg.dataset,
+        autoencoder=AutoencoderConfig(
+            latent_dim=16,
+            base_channels=8,
+            num_stages=3,
+            loss_type="l1",
+            epochs=2,
+            gaussian_sigma=1.0,
+            load_weights=legacy_ckpt,
+            recalibrate=False,
+        ),
+        output=OutputConfig(
+            base_dir=out_base,
+            experiment_name="reload_64_norecal",
+            save_visualizations=False,
+        ),
+        device="cpu",
+    )
+    reload_payload = run_pipeline(reload_only_cfg)
+    out_text = capsys.readouterr().out
+    assert "--recalibrate" in out_text
+    assert reload_payload["calibration"]["calibrated"] is True
+    assert reload_payload["calibration"]["calib_spatial_size"] == 64
+
+    # 2) Load legacy 16x16 checkpoint WITH recalibrate=True -> recomputes 64x64 stats
+    recal_cfg = PipelineConfig(
+        dataset=train_cfg.dataset,
+        autoencoder=AutoencoderConfig(
+            latent_dim=16,
+            base_channels=8,
+            num_stages=3,
+            loss_type="l1",
+            epochs=2,
+            gaussian_sigma=1.0,
+            load_weights=legacy_ckpt,
+            recalibrate=True,
+        ),
+        output=OutputConfig(
+            base_dir=out_base,
+            experiment_name="reload_64_recal",
+            save_visualizations=False,
+        ),
+        device="cpu",
+    )
+    recal_payload = run_pipeline(recal_cfg)
+    assert recal_payload["epoch_losses"] == []
+    assert recal_payload["calibration"]["calibrated"] is True
+    assert recal_payload["calibration"]["calib_spatial_size"] == 64
+    assert recal_payload["hyperparams"]["calib_spatial_size"] == 64
+    assert recal_payload["hyperparams"]["calib_spatial_weight"] == pytest.approx(0.85)
+    assert recal_payload["hyperparams"]["calib_z_shift"] == pytest.approx(0.5)
+    assert recal_payload["hyperparams"]["recalibrate"] is True
+
+    # CLI flags & validation bounds
+    args = build_parser().parse_args(
+        [
+            "--data-dir",
+            str(data_root),
+            "--l1-channel-max-weight",
+            "0.4",
+            "--calib-spatial-size",
+            "32",
+            "--calib-spatial-weight",
+            "0.9",
+            "--calib-z-shift",
+            "0.25",
+            "--recalibrate",
+            "--device",
+            "cpu",
+        ]
+    )
+    cfg_cli = PipelineConfig.from_args(**vars(args))
+    cfg_cli.validate()
+    assert cfg_cli.autoencoder.l1_channel_max_weight == pytest.approx(0.4)
+    assert cfg_cli.autoencoder.calib_spatial_size == 32
+    assert cfg_cli.autoencoder.calib_spatial_weight == pytest.approx(0.9)
+    assert cfg_cli.autoencoder.calib_z_shift == pytest.approx(0.25)
+    assert cfg_cli.autoencoder.recalibrate is True
+
+    for bad_ae in (
+        AutoencoderConfig(l1_channel_max_weight=1.1),
+        AutoencoderConfig(calib_spatial_size=0),
+        AutoencoderConfig(calib_spatial_weight=-0.1),
+        AutoencoderConfig(calib_z_shift=-0.1),
+    ):
+        with pytest.raises(ValueError):
+            PipelineConfig(
+                dataset=DatasetConfig(root_dir=data_root),
+                autoencoder=bad_ae,
+                device="cpu",
+            ).validate()

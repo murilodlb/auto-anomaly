@@ -196,6 +196,11 @@ def _serialize_hyperparams(config: PipelineConfig) -> dict[str, Any]:
         "grad_loss_weight": ae.grad_loss_weight,
         "riad_patch_sizes": list(ae.riad_patch_sizes),
         "riad_num_masks": ae.riad_num_masks,
+        "l1_channel_max_weight": ae.l1_channel_max_weight,
+        "calib_spatial_size": ae.calib_spatial_size,
+        "calib_spatial_weight": ae.calib_spatial_weight,
+        "calib_z_shift": ae.calib_z_shift,
+        "recalibrate": ae.recalibrate,
         "full_res": ds.full_res,
         "grayscale": ds.grayscale,
         "use_amp": ae.use_amp,
@@ -286,6 +291,9 @@ def _run_single_category(
     if config.autoencoder.load_weights is not None:
         model.load(config.autoencoder.load_weights)
         print(f"Loaded weights from {config.autoencoder.load_weights}")
+        if config.autoencoder.recalibrate:
+            print("[INFO] Re-calibrating normal baseline on training split...")
+            model.calibrate(train_split.images, extractor)
     else:
         t_train = time.perf_counter()
         epoch_losses = model.fit(train_split.images, extractor)
@@ -303,8 +311,15 @@ def _run_single_category(
             "err_mean": float(model.net.err_mean.item()),
             "err_std": float(model.net.err_std.item()),
             "texture_damping": config.autoencoder.texture_damping,
+            "calib_spatial_size": int(model.net.normal_mu_map.shape[-1]),
+            "calib_spatial_weight": config.autoencoder.calib_spatial_weight,
+            "calib_z_shift": config.autoencoder.calib_z_shift,
         }
-        if config.autoencoder.load_weights is not None and is_cal:
+        if (
+            config.autoencoder.load_weights is not None
+            and not config.autoencoder.recalibrate
+            and is_cal
+        ):
             print(
                 f"Loaded calibration baseline: err_mean={calibration_info['err_mean']:.6f}, "
                 f"err_std={calibration_info['err_std']:.6f}"

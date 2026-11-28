@@ -144,6 +144,11 @@ class AutoencoderConfig:
     grad_loss_weight: float = 2.0
     riad_patch_sizes: tuple[int, ...] = ()
     riad_num_masks: int = 4
+    l1_channel_max_weight: float = 0.5
+    calib_spatial_size: int = 64
+    calib_spatial_weight: float = 0.85
+    calib_z_shift: float = 0.5
+    recalibrate: bool = False
     use_amp: bool = True
     save_weights: bool = True
     load_weights: Path | None = None
@@ -336,6 +341,18 @@ class PipelineConfig:
             raise ValueError(f"All riad_patch_sizes must be >= 2, got {ae.riad_patch_sizes}")
         if ae.riad_patch_sizes and self.extractor_name != "raw":
             raise ValueError("RIAD spatial grid masking is only supported with extractor='raw'")
+        if not (0.0 <= ae.l1_channel_max_weight <= 1.0):
+            raise ValueError(
+                f"l1_channel_max_weight must be in [0.0, 1.0], got {ae.l1_channel_max_weight}"
+            )
+        if ae.calib_spatial_size < 1:
+            raise ValueError(f"calib_spatial_size must be >= 1, got {ae.calib_spatial_size}")
+        if not (0.0 <= ae.calib_spatial_weight <= 1.0):
+            raise ValueError(
+                f"calib_spatial_weight must be in [0.0, 1.0], got {ae.calib_spatial_weight}"
+            )
+        if ae.calib_z_shift < 0.0:
+            raise ValueError(f"calib_z_shift must be >= 0.0, got {ae.calib_z_shift}")
         if ae.load_weights is not None and not ae.load_weights.is_file():
             raise FileNotFoundError(f"Checkpoint file does not exist: {ae.load_weights}")
 
@@ -422,6 +439,11 @@ class PipelineConfig:
             grad_loss_weight=float(kwargs.get("grad_loss_weight", 2.0)),
             riad_patch_sizes=riad_patch_sizes,
             riad_num_masks=int(kwargs.get("riad_num_masks", 4)),
+            l1_channel_max_weight=float(kwargs.get("l1_channel_max_weight", 0.5)),
+            calib_spatial_size=int(kwargs.get("calib_spatial_size", 64)),
+            calib_spatial_weight=float(kwargs.get("calib_spatial_weight", 0.85)),
+            calib_z_shift=float(kwargs.get("calib_z_shift", 0.5)),
+            recalibrate=bool(kwargs.get("recalibrate", False)),
             use_amp=not bool(kwargs.get("no_amp", False)),
             save_weights=not bool(kwargs.get("no_save_weights", False)),
             load_weights=load_weights,

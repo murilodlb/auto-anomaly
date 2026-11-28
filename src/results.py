@@ -89,6 +89,10 @@ class ExperimentRecord:
     guided_filter_eps: float | None
     grad_loss_weight: float | None
     riad_patch_sizes: str
+    l1_channel_max_weight: float | None
+    calib_spatial_size: int | None
+    calib_spatial_weight: float | None
+    calib_z_shift: float | None
     wta_spatial_window: int | None
     wta_lifetime_sparsity: float | None
     wta_train_density: float | None
@@ -553,6 +557,10 @@ def _build_record_from_run_dir(
         riad_patch_sizes=_format_riad_patch_sizes(
             hp.get("riad_patch_sizes", parsed_name.get("riad_patch_sizes"))
         ),
+        l1_channel_max_weight=_safe_opt_float(hp.get("l1_channel_max_weight")),
+        calib_spatial_size=_safe_int(hp.get("calib_spatial_size")),
+        calib_spatial_weight=_safe_opt_float(hp.get("calib_spatial_weight")),
+        calib_z_shift=_safe_opt_float(hp.get("calib_z_shift")),
         wta_spatial_window=_safe_int(hp.get("wta_spatial_window")),
         wta_lifetime_sparsity=(
             _safe_float(hp.get("wta_lifetime_sparsity"))
@@ -664,6 +672,10 @@ def _build_incomplete_record(inv: FolderInventoryEntry) -> ExperimentRecord:
         guided_filter_eps=None,
         grad_loss_weight=None,
         riad_patch_sizes=_format_riad_patch_sizes(parsed.get("riad_patch_sizes")),
+        l1_channel_max_weight=None,
+        calib_spatial_size=None,
+        calib_spatial_weight=None,
+        calib_z_shift=None,
         wta_spatial_window=None,
         wta_lifetime_sparsity=None,
         wta_train_density=None,

@@ -205,16 +205,20 @@ class WTAConvAutoencoder(torch.nn.Module):
         ema_momentum: float = 0.05,
         eval_threshold_scale: float = 0.8,
         use_sigmoid: bool = True,
+        calib_spatial_size: int = 64,
     ) -> None:
         super().__init__()
         if num_stages < 1:
             raise ValueError(f"num_stages must be >= 1, got {num_stages}")
+        if calib_spatial_size < 1:
+            raise ValueError(f"calib_spatial_size must be >= 1, got {calib_spatial_size}")
 
         self.in_channels = in_channels
         self.base_channels = base_channels
         self.latent_dim = latent_dim
         self.num_stages = num_stages
         self.use_sigmoid = use_sigmoid
+        self.calib_spatial_size = calib_spatial_size
 
         # Persistent calibration buffers matching ConvAutoencoder state_dict contract
         self.register_buffer("err_mean", torch.zeros(1, dtype=torch.float32))  # Shape: (1,)
@@ -222,11 +226,13 @@ class WTAConvAutoencoder(torch.nn.Module):
         self.register_buffer("err_p99", torch.zeros(1, dtype=torch.float32))  # Shape: (1,)
         self.register_buffer("calibrated", torch.zeros(1, dtype=torch.bool))  # Shape: (1,)
         self.register_buffer(
-            "normal_mu_map", torch.zeros((1, 1, 16, 16), dtype=torch.float32)
-        )  # Shape: (1, 1, 16, 16)
+            "normal_mu_map",
+            torch.zeros((1, 1, calib_spatial_size, calib_spatial_size), dtype=torch.float32),
+        )  # Shape: (1, 1, S, S)
         self.register_buffer(
-            "normal_std_map", torch.ones((1, 1, 16, 16), dtype=torch.float32)
-        )  # Shape: (1, 1, 16, 16)
+            "normal_std_map",
+            torch.ones((1, 1, calib_spatial_size, calib_spatial_size), dtype=torch.float32),
+        )  # Shape: (1, 1, S, S)
 
         stage_channels = [min(base_channels * (2**i), 512) for i in range(num_stages)]
 
@@ -345,6 +351,7 @@ class WTAAutoencoderModel(RawAutoencoderModel):
             ema_momentum=self.wta_config.ema_momentum,
             eval_threshold_scale=self.wta_config.eval_threshold_scale,
             use_sigmoid=use_sigmoid,
+            calib_spatial_size=self.config.calib_spatial_size,
         )
 
     def _checkpoint_meta(self) -> dict[str, Any]:
@@ -355,6 +362,12 @@ class WTAAutoencoderModel(RawAutoencoderModel):
             "latent_dim": self.config.latent_dim,
             "num_stages": self.config.num_stages,
             "use_sigmoid": self.net.use_sigmoid,
+            "calib_spatial_size": int(
+                getattr(self.net, "calib_spatial_size", self.config.calib_spatial_size)
+            ),
+            "l1_channel_max_weight": self.config.l1_channel_max_weight,
+            "calib_spatial_weight": self.config.calib_spatial_weight,
+            "calib_z_shift": self.config.calib_z_shift,
             "wta_spatial_window": self.wta_config.spatial_window,
             "wta_lifetime_sparsity": self.wta_config.lifetime_sparsity,
             "wta_eval_threshold_scale": self.wta_config.eval_threshold_scale,

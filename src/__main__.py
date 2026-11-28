@@ -178,6 +178,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of disjoint RIAD masks per patch scale (>= 2)",
     )
     parser.add_argument(
+        "--l1-channel-max-weight",
+        type=float,
+        default=0.5,
+        help="Blend weight between channel-mean and channel-max L1 during scoring",
+    )
+    parser.add_argument(
+        "--calib-spatial-size",
+        type=int,
+        default=64,
+        help="Spatial grid size S for normal baseline mean/std calibration maps",
+    )
+    parser.add_argument(
+        "--calib-spatial-weight",
+        type=float,
+        default=0.85,
+        help="Blend weight between spatial baseline map and global scalar baseline",
+    )
+    parser.add_argument(
+        "--calib-z-shift",
+        type=float,
+        default=0.5,
+        help="Z-score shift inside softplus calibration mapping",
+    )
+    parser.add_argument(
+        "--recalibrate",
+        action="store_true",
+        help="Recompute normal baseline calibration on train split after --load-weights",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="results",

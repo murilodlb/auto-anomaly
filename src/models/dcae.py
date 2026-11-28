@@ -217,17 +217,34 @@ _LOSS_FUNCTIONS: dict[str, Any] = {
 }
 
 
+def _channel_l1_map(
+    x_hat_f32: torch.Tensor,
+    x_f32: torch.Tensor,
+    channel_max_weight: float,
+) -> torch.Tensor:
+    """Blend channel-mean and channel-max L1 error maps (B, 1, H, W)."""
+    abs_diff = (x_f32 - x_hat_f32).abs()  # Shape: (B, C, H, W)
+    mean_map = abs_diff.mean(dim=1, keepdim=True)  # Shape: (B, 1, H, W)
+    if channel_max_weight <= 0.0 or abs_diff.shape[1] == 1:
+        return mean_map  # Shape: (B, 1, H, W)
+    max_map = abs_diff.amax(dim=1, keepdim=True)  # Shape: (B, 1, H, W)
+    return (
+        (1.0 - channel_max_weight) * mean_map + channel_max_weight * max_map
+    )  # Shape: (B, 1, H, W)
+
+
 def _compute_raw_error_map(
     x_hat: torch.Tensor,
     x: torch.Tensor,
     loss_type: str,
     grad_weight: float = 2.0,
+    channel_max_weight: float = 0.0,
 ) -> torch.Tensor:
     """Compute per-pixel (B, 1, H, W) reconstruction error map in float32."""
     x_hat_f32 = x_hat.float()  # Shape: (B, C, H, W)
     x_f32 = x.float()  # Shape: (B, C, H, W)
     if loss_type == "l1":
-        return (x_f32 - x_hat_f32).abs().mean(dim=1, keepdim=True)  # Shape: (B, 1, H, W)
+        return _channel_l1_map(x_hat_f32, x_f32, channel_max_weight)  # Shape: (B, 1, H, W)
     if loss_type == "smooth_l1":
         return torch.nn.functional.smooth_l1_loss(
             x_hat_f32, x_f32, reduction="none"
@@ -238,13 +255,13 @@ def _compute_raw_error_map(
         )  # Shape: (B, H, W)
         return (1.0 - cos).unsqueeze(1)  # Shape: (B, 1, H, W)
     if loss_type == "l1_ssim":
-        l1_map = (x_f32 - x_hat_f32).abs().mean(dim=1, keepdim=True)  # Shape: (B, 1, H, W)
+        l1_map = _channel_l1_map(x_hat_f32, x_f32, channel_max_weight)  # Shape: (B, 1, H, W)
         ssim_err_map = (1.0 - _ssim_map(x_hat_f32, x_f32)).mean(
             dim=1, keepdim=True
         )  # Shape: (B, 1, H, W)
         return 0.2 * l1_map + 0.8 * ssim_err_map  # Shape: (B, 1, H, W)
     if loss_type == "ms_l1_ssim":
-        l1_map = (x_f32 - x_hat_f32).abs().mean(dim=1, keepdim=True)  # Shape: (B, 1, H, W)
+        l1_map = _channel_l1_map(x_hat_f32, x_f32, channel_max_weight)  # Shape: (B, 1, H, W)
         target_hw = (x_f32.shape[-2], x_f32.shape[-1])
         weighted_scales = _iter_msgms_error_scales(x_hat_f32, x_f32)
         total_weight = sum(w for w, _ in weighted_scales)
@@ -264,7 +281,7 @@ def _compute_raw_error_map(
         )  # Shape: (B, 1, H, W)
         return 0.2 * l1_map + 0.8 * ssim_err_map  # Shape: (B, 1, H, W)
     if loss_type == "l1_grad":
-        l1_map = (x_f32 - x_hat_f32).abs().mean(dim=1, keepdim=True)  # Shape: (B, 1, H, W)
+        l1_map = _channel_l1_map(x_hat_f32, x_f32, channel_max_weight)  # Shape: (B, 1, H, W)
         target_hw = (x_f32.shape[-2], x_f32.shape[-1])
         weighted_scales = _iter_ms_grad_l1_scales(x_hat_f32, x_f32)
         total_w = sum(w for w, _ in weighted_scales)
@@ -503,12 +520,15 @@ class ConvAutoencoder(torch.nn.Module):
         num_stages: int = 4,
         spatial_dropout: float = 0.1,
         use_sigmoid: bool = True,
+        calib_spatial_size: int = 64,
     ) -> None:
         super().__init__()
         if num_stages < 1:
             raise ValueError(f"num_stages must be >= 1, got {num_stages}")
         if not (0.0 <= spatial_dropout < 1.0):
             raise ValueError(f"spatial_dropout must be in [0.0, 1.0), got {spatial_dropout}")
+        if calib_spatial_size < 1:
+            raise ValueError(f"calib_spatial_size must be >= 1, got {calib_spatial_size}")
 
         self.in_channels = in_channels
         self.base_channels = base_channels
@@ -516,6 +536,7 @@ class ConvAutoencoder(torch.nn.Module):
         self.num_stages = num_stages
         self.spatial_dropout = spatial_dropout
         self.use_sigmoid = use_sigmoid
+        self.calib_spatial_size = calib_spatial_size
 
         # Persistent calibration buffers (saved/loaded automatically inside state_dict)
         self.register_buffer("err_mean", torch.zeros(1, dtype=torch.float32))  # Shape: (1,)
@@ -523,11 +544,13 @@ class ConvAutoencoder(torch.nn.Module):
         self.register_buffer("err_p99", torch.zeros(1, dtype=torch.float32))  # Shape: (1,)
         self.register_buffer("calibrated", torch.zeros(1, dtype=torch.bool))  # Shape: (1,)
         self.register_buffer(
-            "normal_mu_map", torch.zeros((1, 1, 16, 16), dtype=torch.float32)
-        )  # Shape: (1, 1, 16, 16)
+            "normal_mu_map",
+            torch.zeros((1, 1, calib_spatial_size, calib_spatial_size), dtype=torch.float32),
+        )  # Shape: (1, 1, S, S)
         self.register_buffer(
-            "normal_std_map", torch.ones((1, 1, 16, 16), dtype=torch.float32)
-        )  # Shape: (1, 1, 16, 16)
+            "normal_std_map",
+            torch.ones((1, 1, calib_spatial_size, calib_spatial_size), dtype=torch.float32),
+        )  # Shape: (1, 1, S, S)
 
         stage_channels = [min(base_channels * (2**i), 512) for i in range(num_stages)]
 
@@ -758,6 +781,11 @@ class RawAutoencoderModel:
         )
         self._riad_mask_cache: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
+    @property
+    def _channel_max_weight(self) -> float:
+        """Apply peak-channel L1 emphasis only in bounded pixel space."""
+        return self.config.l1_channel_max_weight if self.use_sigmoid else 0.0
+
     def _build_network(self, in_channels: int, use_sigmoid: bool) -> Any:
         """Instantiate the underlying autoencoder network."""
         return ConvAutoencoder(
@@ -767,6 +795,7 @@ class RawAutoencoderModel:
             num_stages=self.config.num_stages,
             spatial_dropout=self.config.spatial_dropout,
             use_sigmoid=use_sigmoid,
+            calib_spatial_size=self.config.calib_spatial_size,
         )
 
     def _checkpoint_meta(self) -> dict[str, Any]:
@@ -779,6 +808,12 @@ class RawAutoencoderModel:
             "num_stages": self.config.num_stages,
             "spatial_dropout": getattr(self.net, "spatial_dropout", self.config.spatial_dropout),
             "use_sigmoid": self.net.use_sigmoid,
+            "calib_spatial_size": int(
+                getattr(self.net, "calib_spatial_size", self.config.calib_spatial_size)
+            ),
+            "l1_channel_max_weight": self.config.l1_channel_max_weight,
+            "calib_spatial_weight": self.config.calib_spatial_weight,
+            "calib_z_shift": self.config.calib_z_shift,
         }
 
     def _expected_checkpoint_meta(self) -> dict[str, Any]:
@@ -952,6 +987,7 @@ class RawAutoencoderModel:
                 x,
                 self.config.loss_type,
                 grad_weight=self.config.grad_loss_weight,
+                channel_max_weight=self._channel_max_weight,
             )  # Shape: (B, 1, H, W)
             scale_recons.append(x_hat_scale)
             scale_err_maps.append(err_scale)
@@ -982,6 +1018,7 @@ class RawAutoencoderModel:
                 x,
                 self.config.loss_type,
                 grad_weight=self.config.grad_loss_weight,
+                channel_max_weight=self._channel_max_weight,
             )  # Shape: (B, 1, H_in, W_in)
 
         # Apply texture variance damping only in [0, 1] pixel space (not ViT patch grids)
@@ -1022,28 +1059,48 @@ class RawAutoencoderModel:
             )  # Shape: (B, 1, H_out, W_out)
 
         if apply_calibration and bool(self.net.calibrated.item()):
-            mu_map = 0.5 * self.net.err_mean + 0.5 * torch.nn.functional.interpolate(
+            w_sp = self.config.calib_spatial_weight
+            w_gl = 1.0 - w_sp
+            spatial_mu = torch.nn.functional.interpolate(
                 self.net.normal_mu_map,
                 size=err_map.shape[-2:],
                 mode="bilinear",
                 align_corners=False,
             )  # Shape: (1, 1, H_out, W_out)
-            std_map = (
-                0.5 * self.net.err_std
-                + 0.5
-                * torch.nn.functional.interpolate(
-                    self.net.normal_std_map,
-                    size=err_map.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            ).clamp(min=1e-4)  # Shape: (1, 1, H_out, W_out)
+            spatial_std = torch.nn.functional.interpolate(
+                self.net.normal_std_map,
+                size=err_map.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )  # Shape: (1, 1, H_out, W_out)
+            mu_map = w_gl * self.net.err_mean + w_sp * spatial_mu  # Shape: (1, 1, H_out, W_out)
+            std_map = (w_gl * self.net.err_std + w_sp * spatial_std).clamp(
+                min=1e-4
+            )  # Shape: (1, 1, H_out, W_out)
             z_map = (err_map - mu_map) / std_map  # Shape: (B, 1, H_out, W_out)
             err_map = torch.nn.functional.softplus(
-                z_map - 1.5, beta=2.0
+                z_map - self.config.calib_z_shift, beta=2.0
             )  # Shape: (B, 1, H_out, W_out)
 
         return x_hat_f32, err_map
+
+    def calibrate(self, train_images: np.ndarray, extractor: Any) -> None:
+        """Compute or recompute normal baseline calibration statistics on training images."""
+        cached_features = self._maybe_cache_train_features(train_images, extractor)
+        train_gpu_u8 = (
+            None
+            if cached_features is not None
+            else self._maybe_preload_train_gpu(train_images, extractor)
+        )
+        try:
+            self._calibrate_normal_baseline(
+                train_images,
+                extractor,
+                train_gpu_u8,
+                cached_features=cached_features,
+            )
+        finally:
+            del train_gpu_u8, cached_features
 
     def _calibrate_normal_baseline(
         self,
@@ -1054,10 +1111,15 @@ class RawAutoencoderModel:
     ) -> None:
         """Estimate defect-free training pixel error baseline statistics in eval mode."""
         self.net.eval()
+        sp_size = int(self.net.normal_mu_map.shape[-1])
         sum_err = torch.zeros((), dtype=torch.float64, device=self.device)
         sum_err_sq = torch.zeros((), dtype=torch.float64, device=self.device)
-        spatial_sum = torch.zeros((1, 1, 16, 16), dtype=torch.float64, device=self.device)
-        spatial_sum_sq = torch.zeros((1, 1, 16, 16), dtype=torch.float64, device=self.device)
+        spatial_sum = torch.zeros(
+            (1, 1, sp_size, sp_size), dtype=torch.float64, device=self.device
+        )  # Shape: (1, 1, S, S)
+        spatial_sum_sq = torch.zeros(
+            (1, 1, sp_size, sp_size), dtype=torch.float64, device=self.device
+        )  # Shape: (1, 1, S, S)
         total_pixels = 0
         total_images = 0
 
@@ -1103,9 +1165,9 @@ class RawAutoencoderModel:
                 sum_err_sq += (err_f64 * err_f64).sum()
                 total_pixels += err_map.numel()
 
-                pooled = torch.nn.functional.adaptive_avg_pool2d(err_map, (16, 16)).to(
-                    torch.float64
-                )  # Shape: (B, 1, 16, 16)
+                pooled = torch.nn.functional.adaptive_avg_pool2d(
+                    err_map, (sp_size, sp_size)
+                ).to(torch.float64)  # Shape: (B, 1, S, S)
                 spatial_sum += pooled.sum(dim=0, keepdim=True)
                 spatial_sum_sq += (pooled * pooled).sum(dim=0, keepdim=True)
                 total_images += x.shape[0]
@@ -1323,7 +1385,44 @@ class RawAutoencoderModel:
                 raise ValueError(
                     f"Checkpoint mismatch for {key}: expected {val}, found {meta[key]}"
                 )
-        self.net.load_state_dict(payload["state_dict"])
+
+        if not self.config.recalibrate:
+            scoring_diffs = []
+            for key, cur_val in (
+                ("l1_channel_max_weight", self.config.l1_channel_max_weight),
+                ("calib_spatial_weight", self.config.calib_spatial_weight),
+                ("calib_z_shift", self.config.calib_z_shift),
+                ("calib_spatial_size", self.config.calib_spatial_size),
+            ):
+                if key not in meta or meta[key] != cur_val:
+                    scoring_diffs.append(key)
+            if scoring_diffs:
+                print(
+                    f"[WARN] Checkpoint scoring/calibration metadata ({', '.join(scoring_diffs)}) "
+                    "is legacy or differs from current config; pass --recalibrate for exact "
+                    "baseline statistics.",
+                    flush=True,
+                )
+
+        state_dict = dict(payload["state_dict"])
+        for buf_name in ("normal_mu_map", "normal_std_map"):
+            if buf_name in state_dict and hasattr(self.net, buf_name):
+                target_buf_hw = tuple(getattr(self.net, buf_name).shape[-2:])
+                src_hw = tuple(state_dict[buf_name].shape[-2:])
+                if src_hw != target_buf_hw:
+                    state_dict[buf_name] = torch.nn.functional.interpolate(
+                        state_dict[buf_name].float(),
+                        size=target_buf_hw,
+                        mode="bilinear",
+                        align_corners=False,
+                    )  # Shape: (1, 1, S, S)
+                    print(
+                        f"[INFO] Resized checkpoint {buf_name} from {src_hw} to {target_buf_hw}; "
+                        "pass --recalibrate for exact spatial baseline statistics.",
+                        flush=True,
+                    )
+
+        self.net.load_state_dict(state_dict)
         self.net.to(device=self.device)
         if self.device.type == "cuda":
             self.net.to(memory_format=torch.channels_last)

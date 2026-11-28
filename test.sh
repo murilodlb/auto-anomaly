@@ -85,6 +85,12 @@ GUIDED_FILTER_EPS="${GUIDED_FILTER_EPS:-0.01}"
 GRAD_LOSS_WEIGHT="${GRAD_LOSS_WEIGHT:-2.0}"
 RIAD_PATCH_SIZES="${RIAD_PATCH_SIZES:-}"
 RIAD_NUM_MASKS="${RIAD_NUM_MASKS:-4}"
+L1_CHANNEL_MAX_WEIGHT="${L1_CHANNEL_MAX_WEIGHT:-0.5}"
+CALIB_SPATIAL_SIZE="${CALIB_SPATIAL_SIZE:-64}"
+CALIB_SPATIAL_WEIGHT="${CALIB_SPATIAL_WEIGHT:-0.85}"
+CALIB_Z_SHIFT="${CALIB_Z_SHIFT:-0.5}"
+LOAD_WEIGHTS="${LOAD_WEIGHTS:-}"
+RECALIBRATE="${RECALIBRATE:-0}"
 WTA_SPATIAL_WINDOW="${WTA_SPATIAL_WINDOW:-4}"
 WTA_LIFETIME_SPARSITY="${WTA_LIFETIME_SPARSITY:-0.2}"
 WTA_EVAL_SCALE="${WTA_EVAL_SCALE:-0.8}"
@@ -111,10 +117,45 @@ TIFF_SUFFIX=""
 if [[ "${SAVE_TIFF}" == "1" ]]; then
     TIFF_SUFFIX="_tiff"
 fi
+RELOAD_SUFFIX=""
+if [[ -n "${LOAD_WEIGHTS}" ]]; then
+    if [[ "${RECALIBRATE}" == "1" ]]; then
+        RELOAD_SUFFIX="_recal"
+    else
+        RELOAD_SUFFIX="_reload"
+    fi
+fi
+RES_TAG="fullres"
+if [[ "${FULL_RES:-1}" != "1" ]]; then
+    RES_TAG="stdres"
+fi
+
+LOSS_SUFFIX=""
+if [[ "${LOSS}" == "l1_grad" ]]; then
+    LOSS_SUFFIX="_gw${GRAD_LOSS_WEIGHT}"
+fi
+
+WTA_SUFFIX=""
+if [[ "${MODEL}" == "wta_ae" ]]; then
+    WTA_SUFFIX="_ww${WTA_SPATIAL_WINDOW}_ws${WTA_LIFETIME_SPARSITY}_we${WTA_EVAL_SCALE}"
+fi
+
+DINOV3_SUFFIX=""
+if [[ "${EXTRACTOR}" == "dinov3" ]]; then
+    if [[ -n "${DINOV3_STRIDE:-}" ]]; then
+        DINOV3_SUFFIX+="_st${DINOV3_STRIDE}"
+    fi
+    if [[ "${DINOV3_PRUNE_REGISTERS:-0}" == "1" ]]; then
+        DINOV3_SUFFIX+="_pr"
+    fi
+fi
+
+HP_SUFFIX="_bs${BATCH_SIZE}_lr${LR}_drop${SPATIAL_DROPOUT}_den${DENOISE_PROB}_sig${GAUSSIAN_SIGMA}_td${TEXTURE_DAMPING}_gfr${GUIDED_FILTER_RADIUS}_gfe${GUIDED_FILTER_EPS}_k${TOP_K_PCT}_lf${LOSS_FLOOR}_cmax${L1_CHANNEL_MAX_WEIGHT}_cs${CALIB_SPATIAL_SIZE}_cw${CALIB_SPATIAL_WEIGHT}_cz${CALIB_Z_SHIFT}${LOSS_SUFFIX}${WTA_SUFFIX}${DINOV3_SUFFIX}${RIAD_SUFFIX}_seed${SEED}${RELOAD_SUFFIX}${TIFF_SUFFIX}"
+
 if [[ "${EXTRACTOR}" == "raw" ]]; then
-    EXP_NAME="${EXP_NAME:-${CATEGORY}_${MODEL}_fullres_${LOSS}_s${NUM_STAGES}_c${BASE_CHANNELS}_z${LATENT_DIM}_ep${EPOCHS}_drop${SPATIAL_DROPOUT}_gfr${GUIDED_FILTER_RADIUS}${RIAD_SUFFIX}${TIFF_SUFFIX}}"
+    EXP_NAME="${EXP_NAME:-${CATEGORY}_${MODEL}_${RES_TAG}_${LOSS}_s${NUM_STAGES}_c${BASE_CHANNELS}_z${LATENT_DIM}_ep${EPOCHS}${HP_SUFFIX}}"
 else
-    EXP_NAME="${EXP_NAME:-${CATEGORY}_${MODEL}_fullres_${EXTRACTOR}_${LOSS}_s${NUM_STAGES}_c${BASE_CHANNELS}_z${LATENT_DIM}_ep${EPOCHS}_drop${SPATIAL_DROPOUT}_gfr${GUIDED_FILTER_RADIUS}${RIAD_SUFFIX}${TIFF_SUFFIX}}"
+    EXP_NAME="${EXP_NAME:-${CATEGORY}_${MODEL}_${RES_TAG}_${EXTRACTOR}_${LOSS}_s${NUM_STAGES}_c${BASE_CHANNELS}_z${LATENT_DIM}_ep${EPOCHS}${HP_SUFFIX}}"
 fi
 
 EXTRA_ARGS=()
@@ -126,6 +167,12 @@ if [[ "${SAVE_TIFF}" == "1" ]]; then
 fi
 if (( ${#_riad_arr[@]} > 0 )); then
     EXTRA_ARGS+=(--riad-patch-sizes "${_riad_arr[@]}")
+fi
+if [[ -n "${LOAD_WEIGHTS}" ]]; then
+    EXTRA_ARGS+=(--load-weights "${LOAD_WEIGHTS}")
+fi
+if [[ "${RECALIBRATE}" == "1" ]]; then
+    EXTRA_ARGS+=(--recalibrate)
 fi
 if [[ "${EXTRACTOR}" == "dinov3" ]]; then
     if [[ -n "${DINOV3_MODEL:-}" ]]; then
@@ -178,10 +225,14 @@ echo "  EPOCHS / BATCH_SIZE  : ${EPOCHS} / ${BATCH_SIZE}"
 echo "  SPATIAL_DROPOUT      : ${SPATIAL_DROPOUT}"
 echo "  DENOISE_PROB         : ${DENOISE_PROB}"
 echo "  GAUSSIAN_SIGMA       : ${GAUSSIAN_SIGMA}"
+echo "  TEXTURE_DAMPING      : ${TEXTURE_DAMPING}"
 echo "  TOP_K_PCT            : ${TOP_K_PCT}"
 echo "  GUIDED_FILTER_RADIUS : ${GUIDED_FILTER_RADIUS} (eps=${GUIDED_FILTER_EPS})"
 echo "  GRAD_LOSS_WEIGHT     : ${GRAD_LOSS_WEIGHT}"
 echo "  RIAD_PATCH_SIZES     : ${RIAD_PATCH_SIZES:-disabled} (masks=${RIAD_NUM_MASKS})"
+echo "  L1_CH_MAX_WEIGHT     : ${L1_CHANNEL_MAX_WEIGHT}"
+echo "  CALIB (S / W / ZSh)  : ${CALIB_SPATIAL_SIZE} / ${CALIB_SPATIAL_WEIGHT} / ${CALIB_Z_SHIFT}"
+echo "  LOAD_WEIGHTS / RECAL : ${LOAD_WEIGHTS:-none} / ${RECALIBRATE}"
 echo "  SAVE_TIFF / SEED     : ${SAVE_TIFF} / ${SEED}"
 echo "------------------------------------------------------------"
 
@@ -209,6 +260,10 @@ echo "[2/2] Launching Experiment: ${EXP_NAME} (Category: ${CATEGORY}, Model: ${M
     --guided-filter-eps "${GUIDED_FILTER_EPS}" \
     --grad-loss-weight "${GRAD_LOSS_WEIGHT}" \
     --riad-num-masks "${RIAD_NUM_MASKS}" \
+    --l1-channel-max-weight "${L1_CHANNEL_MAX_WEIGHT}" \
+    --calib-spatial-size "${CALIB_SPATIAL_SIZE}" \
+    --calib-spatial-weight "${CALIB_SPATIAL_WEIGHT}" \
+    --calib-z-shift "${CALIB_Z_SHIFT}" \
     --wta-spatial-window "${WTA_SPATIAL_WINDOW}" \
     --wta-lifetime-sparsity "${WTA_LIFETIME_SPARSITY}" \
     --wta-eval-scale "${WTA_EVAL_SCALE}" \
